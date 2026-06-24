@@ -1,0 +1,27 @@
+[package]
+name = "cosmic-comic"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "A native COSMIC desktop comic book (.cbz/.cbr) reader"
+
+[dependencies]
+env_logger = "0.11"
+tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread"] }
+url = "2.5"
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+] }
+compress-tools = "0.15"
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic.git"
+default-features = false
+features = ["dbus-config", "wgpu", "wayland", "winit", "tokio", "xdg-portal", "multi-window"]
+
+[profile.release]
+lto = true
