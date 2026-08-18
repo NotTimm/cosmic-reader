@@ -46,16 +46,18 @@ pub fn db_path() -> PathBuf {
     app_data_dir().join("library.db")
 }
 
+/// A stable hash of a path/string, used to derive cache directory names that
+/// don't change across runs.
+pub fn path_hash(s: &str) -> String {
+    let hash: u64 = s.bytes().enumerate().fold(0u64, |acc, (i, b)| {
+        acc.wrapping_add((b as u64).wrapping_mul(31u64.wrapping_pow(i as u32 & 0x1f)))
+    });
+    format!("{hash:016x}")
+}
+
 /// Returns the directory where chapter-cover thumbnails for a series are cached.
 pub fn series_cover_dir(series_path: &str) -> PathBuf {
-    // Stable hash so the directory name doesn't change across runs.
-    let hash: u64 = series_path
-        .bytes()
-        .enumerate()
-        .fold(0u64, |acc, (i, b)| {
-            acc.wrapping_add((b as u64).wrapping_mul(31u64.wrapping_pow(i as u32 & 0x1f)))
-        });
-    app_data_dir().join("covers").join(format!("{hash:016x}"))
+    app_data_dir().join("covers").join(path_hash(series_path))
 }
 
 pub fn chapter_cover_path(series_path: &str, chapter_idx: usize) -> PathBuf {
