@@ -24,8 +24,14 @@ serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# Fork of pop-os/libcosmic that forwards winit's trackpad pinch gesture
+# (WindowEvent::PinchGesture) through iced as mouse::Event::WheelZoomed,
+# which upstream iced drops entirely. See NotTimm/libcosmic's single commit
+# on top of pop-os/libcosmic for the diff. Re-sync by rebasing that commit
+# onto a newer pop-os/libcosmic and updating `rev` below.
 [dependencies.libcosmic]
-git = "https://github.com/pop-os/libcosmic.git"
+git = "https://github.com/NotTimm/libcosmic.git"
+rev = "b30d948887892894d86e3e9401a93ea509ebacf6"
 default-features = false
 features = ["dbus-config", "wgpu", "wayland", "winit", "tokio", "xdg-portal", "multi-window"]
 

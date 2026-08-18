@@ -84,6 +84,7 @@ pub enum Message {
     Key(Key),
     ModifiersChanged(keyboard::Modifiers),
     WheelScrolled(mouse::ScrollDelta),
+    TrackpadZoom(f32),
     Touch(touch::Event),
     // Drag and drop
     FilesDropped(Vec<PathBuf>),
@@ -608,6 +609,10 @@ impl Application for App {
                 event::Status::Ignored => Some(Message::WheelScrolled(delta)),
                 event::Status::Captured => None,
             },
+            event::Event::Mouse(mouse::Event::WheelZoomed { delta }) => match status {
+                event::Status::Ignored => Some(Message::TrackpadZoom(delta)),
+                event::Status::Captured => None,
+            },
             event::Event::Touch(t) => Some(Message::Touch(t)),
             event::Event::Window(window::Event::FileDropped(paths)) => {
                 Some(Message::FilesDropped(paths))
@@ -882,6 +887,11 @@ impl Application for App {
                     if dy != 0.0 {
                         self.apply_zoom(ZOOM_STEP.powf(dy.signum()));
                     }
+                }
+            }
+            Message::TrackpadZoom(delta) => {
+                if self.app_view == AppView::Reader && !self.sources.is_empty() {
+                    self.apply_zoom(1.0 + delta);
                 }
             }
             Message::Touch(event) => self.handle_touch(event),
@@ -1220,7 +1230,7 @@ impl App {
                     .push(icon::from_name("image-x-generic-symbolic").size(64))
                     .push(widget::text::title3("Open a comic to start reading"))
                     .push(widget::text(
-                        "← → page  ·  C chapters  ·  L layout  ·  M zoom  ·  Ctrl+scroll / pinch to zoom  ·  T theater  ·  F fullscreen  ·  I info  ·  P copy",
+                        "← → page  ·  C chapters  ·  L layout  ·  M zoom  ·  pinch or Ctrl+scroll to zoom  ·  T theater  ·  F fullscreen  ·  I info  ·  P copy",
                     ).size(12))
                     .push(widget::text("You can also drag and drop a file or folder here.").size(12))
                     .push(widget::button::suggested("Open Comic").on_press(Message::OpenFile))
