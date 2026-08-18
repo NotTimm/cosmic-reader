@@ -14,6 +14,9 @@ desktop-dst := base-dir / 'share' / 'applications' / (APPID + '.desktop')
 icon-src := 'res' / 'icons' / (APPID + '.svg')
 icon-dst := base-dir / 'share' / 'icons' / 'hicolor' / 'scalable' / 'apps' / (APPID + '.svg')
 
+metainfo-src := 'res' / (APPID + '.metainfo.xml')
+metainfo-dst := base-dir / 'share' / 'metainfo' / (APPID + '.metainfo.xml')
+
 # Default recipe: build in release mode
 default: build-release
 
@@ -37,11 +40,30 @@ install:
     install -Dm0755 {{bin-src}} {{bin-dst}}
     install -Dm0644 {{desktop-src}} {{desktop-dst}}
     install -Dm0644 {{icon-src}} {{icon-dst}}
+    install -Dm0644 {{metainfo-src}} {{metainfo-dst}}
 
 # Removes installed files
 uninstall:
-    rm -f {{bin-dst}} {{desktop-dst}} {{icon-dst}}
+    rm -f {{bin-dst}} {{desktop-dst}} {{icon-dst}} {{metainfo-dst}}
+
+# Build every package format this machine can (output in ./dist)
+package:
+    bash packaging/build-all.sh
+
+# Build individual package formats
+package-deb:
+    bash packaging/build-deb.sh
+package-rpm:
+    bash packaging/build-rpm.sh
+package-appimage:
+    bash packaging/build-appimage.sh
+package-flatpak:
+    bash packaging/build-flatpak.sh
 
 # Runs `cargo clean`
 clean:
     cargo clean
+
+# Removes built packages
+clean-dist:
+    rm -rf dist

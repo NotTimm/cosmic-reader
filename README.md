@@ -6,6 +6,8 @@ archives (`.cbz`/`.cbr`), manga/comic series folders, and `.epub` books.
 ## Features
 
 - Library view with covers, search, and a "Continue Reading" shelf
+- Add library folders that get scanned and grouped automatically
+- Settings drawer: backdrop style & opacity, layout, metadata lookup
 - Chapter-aware series folders (nested `.cbz`/`.cbr`/image-dir chapters)
 - Fast CBR opening: pages are extracted in one pass and cached on disk
   instead of re-streaming the archive per page (see src/comic.rs)
@@ -24,6 +26,48 @@ archives (`.cbz`/`.cbr`), manga/comic series folders, and `.epub` books.
 ```
 just build-release
 ```
+
+## Packaging a release
+
+```
+just package          # every format this machine has tooling for
+just package-deb      # or one at a time
+just package-rpm
+just package-appimage
+just package-flatpak
+```
+
+Output lands in `./dist`. The version comes from `Cargo.toml` — bump it
+there and the packages follow.
+
+The `.deb` and `.rpm` deliberately **do not** bundle libraries: their
+dependencies are generated from the binary's actual ELF links
+(`dpkg-shlibdeps` and rpm's automatic requires), so they pull
+`libarchive`, `libxkbcommon`, `openssl` etc. from the distro. The
+AppImage bundles those same libraries since it can't rely on packages,
+and the Flatpak builds against the freedesktop 24.08 runtime.
+
+Tooling needed per format (each script tells you if something's missing):
+
+| Format   | Needs |
+|----------|-------|
+| deb      | `dpkg-dev` |
+| rpm      | `rpm-build` |
+| AppImage | `curl` (fetches `appimagetool` on first run) |
+| Flatpak  | `flatpak`, `flatpak-builder` |
+
+## Where your data lives
+
+Following the XDG spec, so it survives reinstalls and upgrades:
+
+| Path | Contents |
+|------|----------|
+| `~/.local/share/cosmic-comic/library.db` | Library, reading progress, metadata |
+| `~/.config/cosmic-comic/settings.json` | Preferences |
+| `~/.cache/cosmic-comic/` | Cover thumbnails, extracted archives — safe to delete |
+
+The database is versioned with SQLite's `user_version` pragma and migrated
+in place on startup, so upgrading never requires wiping your library.
 
 ## Installing / updating
 

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.tsingel.CosmicComic</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+
+  <name>Cosmic Comic</name>
+  <summary>Read comic books and ebooks</summary>
+
+  <description>
+    <p>
+      A native COSMIC desktop reader for comic book archives (.cbz/.cbr),
+      manga and comic series folders, and .epub books.
+    </p>
+    <ul>
+      <li>Library view with covers, search, and a Continue Reading shelf</li>
+      <li>Scan whole library folders and group them automatically</li>
+      <li>Chapter-aware series folders with fast archive extraction</li>
+      <li>Single and dual page layouts, theater mode, fullscreen</li>
+      <li>Zoom and pan with trackpad or touchscreen pinch</li>
+      <li>Metadata and cover art from ComicVine and AniList</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.tsingel.CosmicComic.desktop</launchable>
+
+  <url type="homepage">https://github.com/NotTimm/cosmic-reader</url>
+  <url type="bugtracker">https://github.com/NotTimm/cosmic-reader/issues</url>
+
+  <developer id="com.tsingel">
+    <name>Tim Singel</name>
+  </developer>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.0-beta.1" date="2026-08-18">
+      <description>
+        <p>First beta release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

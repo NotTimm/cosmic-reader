@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cosmic::app::{Core, Task};
@@ -22,14 +22,19 @@ use crate::comicinfo::{self, ComicInfo};
 use crate::comicvine::{self, ComicVineMatch};
 use crate::library::{self, SeriesEntry};
 use crate::metadata::{self, ParsedFilename, SeriesMetadata};
+use crate::settings::{Background as BgStyle, Settings};
+
+/// Dropdown labels for [`BgStyle::ALL`], kept in the same order.
+const BG_LABELS: [&str; 2] = ["Theme", "Black"];
 
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 8.0;
 
 pub const APP_ID: &str = "com.tsingel.CosmicComic";
 
-const PRELOAD_RADIUS: usize = 3;
-const CACHE_RADIUS: usize = 10;
+const PRELOAD_NEAR: usize = 1;
+const PRELOAD_FAR: usize = 6;
+const CACHE_RADIUS: usize = 14;
 const THUMB_W: u32 = 120;
 const THUMB_H: u32 = 170;
 
@@ -40,6 +45,10 @@ pub enum AppView { Library, Reader }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Layout { Single, Dual }
+
+/// Which panel the context drawer is currently showing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContextPage { Settings, Info }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
@@ -82,6 +91,17 @@ pub enum Message {
     // Library
     LibrarySearchChanged(String),
     LibraryCoverReady { series_id: i64, path: PathBuf },
+    AddLibraryFolder,
+    LibraryFolderSelected(Url),
+    RemoveLibraryFolder(PathBuf),
+    // Settings
+    ToggleSettings,
+    CloseContext,
+    SetBackgroundOpacity(f32),
+    SetBackground(usize),
+    SetFetchMetadata(bool),
+    LibraryEntryScanned(Result<ScanOutcome, String>),
+    LibraryScanCoverDone(Result<(), String>),
     // Keys / pointer / touch
     Key(Key),
     ModifiersChanged(keyboard::Modifiers),
@@ -108,6 +128,9 @@ pub struct App {
     cache: HashMap<usize, (widget::image::Handle, Arc<comic::Page>)>,
     pending: HashSet<usize>,
     current_page: usize,
+    /// Last navigation direction (>0 forward, <0 backward, 0 unknown), used
+    /// to bias page preloading toward where the reader is actually headed.
+    nav_dir: i8,
     loading: bool,
     error: Option<String>,
     fullscreen: bool,
@@ -115,7 +138,6 @@ pub struct App {
     layout: Layout,
     zoom_active: bool,
     zoom: f32,
-    show_info: bool,
     show_chapter_select: bool,
     metadata: Option<SeriesMetadata>,
     metadata_loading: bool,
@@ -139,6 +161,10 @@ pub struct App {
     library_entries: Vec<SeriesEntry>,
     library_search: String,
     library_covers: HashMap<i64, widget::image::Handle>,
+    library_dirs: Vec<PathBuf>,
+    // settings
+    settings: Settings,
+    context_page: ContextPage,
 }
 
 // ── Task helpers ──────────────────────────────────────────────────────────────
@@ -178,8 +204,154 @@ fn open_any(path: PathBuf) -> Task<Message> {
     }
 }
 
+/// Immediate children of a library folder that look openable: subfolders
+/// (treated as series — each may hold one or many issues/chapters) and
+/// loose .cbz/.cbr/.epub files (treated as standalone items).
+fn discover_library_entries(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.push(path);
+            continue;
+        }
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".cbz")
+            || lower.ends_with(".cbr")
+            || lower.ends_with(".zip")
+            || lower.ends_with(".rar")
+            || epub::is_epub_name(&name)
+        {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// What a background library scan found for one entry, enough to register
+/// it in the DB and generate a cover without disturbing reader state.
+#[derive(Clone, Debug)]
+pub struct ScanOutcome {
+    path: PathBuf,
+    title: String,
+    count: usize,
+    is_series: bool,
+    first_page: Option<PageSource>,
+    epub_cover: Option<Vec<u8>>,
+}
+
+fn scan_entry_task(path: PathBuf) -> Task<Message> {
+    cosmic::task::future(async move {
+        let scan_path = path.clone();
+        let is_epub =
+            path.file_name().map(|n| epub::is_epub_name(&n.to_string_lossy())).unwrap_or(false);
+        let is_series = path.is_dir();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<ScanOutcome, String> {
+            if is_epub {
+                let book = epub::open(&scan_path)?;
+                Ok(ScanOutcome {
+                    path: scan_path,
+                    title: book.title,
+                    count: book.chapters.len(),
+                    is_series: false,
+                    first_page: None,
+                    epub_cover: book.cover,
+                })
+            } else {
+                let (sources, _chapters) = comic::collect_sources(&scan_path)?;
+                let title = metadata::extract_title(
+                    &scan_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                );
+                let first_page = sources.first().cloned();
+                Ok(ScanOutcome {
+                    path: scan_path,
+                    title,
+                    count: sources.len(),
+                    is_series,
+                    first_page,
+                    epub_cover: None,
+                })
+            }
+        })
+        .await;
+
+        Message::LibraryEntryScanned(match result {
+            Ok(inner) => inner,
+            Err(e) => Err(format!("scan panicked: {e}")),
+        })
+    })
+}
+
+/// Generates and caches a series' ch0 cover thumbnail from the comic's
+/// first page, independent of any currently-open reader state (unlike
+/// `cover_task`, which updates `chapter_covers` for whatever's open).
+fn comic_library_cover_task(source: PageSource, path: PathBuf) -> Task<Message> {
+    cosmic::task::future(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let page = comic::decode_source(&source)?;
+            let img = image::RgbaImage::from_raw(page.width, page.height, page.rgba)
+                .ok_or_else(|| "bad rgba".to_string())?;
+            let thumb = image::imageops::resize(
+                &img, THUMB_W, THUMB_H, image::imageops::FilterType::Triangle,
+            );
+            save_cover_thumb(&thumb, &path)
+        })
+        .await;
+        Message::LibraryScanCoverDone(match result {
+            Ok(r) => r,
+            Err(e) => Err(format!("cover panicked: {e}")),
+        })
+    })
+}
+
+fn epub_library_cover_task(cover_bytes: Vec<u8>, path: PathBuf) -> Task<Message> {
+    cosmic::task::future(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let img = image::load_from_memory(&cover_bytes)
+                .map_err(|e| format!("decode cover: {e}"))?;
+            let thumb = image::imageops::resize(
+                &img.to_rgba8(), THUMB_W, THUMB_H, image::imageops::FilterType::Triangle,
+            );
+            save_cover_thumb(&thumb, &path)
+        })
+        .await;
+        Message::LibraryScanCoverDone(match result {
+            Ok(r) => r,
+            Err(e) => Err(format!("cover panicked: {e}")),
+        })
+    })
+}
+
+fn save_cover_thumb(thumb: &image::RgbaImage, path: &Path) -> Result<(), String> {
+    let cover_path = library::chapter_cover_path(&path.to_string_lossy(), 0);
+    if let Some(parent) = cover_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    thumb.save(&cover_path).map_err(|e| format!("save cover: {e}"))
+}
+
+/// Caps how many full-resolution page decodes run at once. Decoding a
+/// large scanned page is genuinely CPU-heavy; letting the whole preload
+/// window (7+ pages) decode simultaneously means the page actually on
+/// screen competes for CPU with pages the reader hasn't gotten to yet,
+/// which is the main reason initial page loads felt slow. A small cap
+/// keeps the current/next page decode from being starved.
+fn decode_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        tokio::sync::Semaphore::new((cores / 2).max(2))
+    })
+}
+
 fn decode_task(index: usize, source: PageSource) -> Task<Message> {
     cosmic::task::future(async move {
+        let _permit = decode_semaphore().acquire().await;
         let result = tokio::task::spawn_blocking(move || comic::decode_source(&source)).await;
         Message::PageDecoded(
             index,
@@ -277,6 +449,10 @@ fn load_cover_from_disk(series_id: i64, path: PathBuf) -> Task<Message> {
 // ── App helpers ───────────────────────────────────────────────────────────────
 
 impl App {
+    /// Queues decodes for pages around the current one, biased toward
+    /// whichever direction the reader is actually flipping — reading is
+    /// overwhelmingly sequential, so weighting the preload window that way
+    /// makes it much less likely fast paging outruns what's already decoded.
     fn refresh_window(&mut self) -> Task<Message> {
         let len = self.sources.len();
         if len == 0 {
@@ -286,19 +462,33 @@ impl App {
         let keep_end = (self.current_page + CACHE_RADIUS).min(len - 1);
         self.cache.retain(|idx, _| (keep_start..=keep_end).contains(idx));
 
-        let mut tasks = Vec::new();
-        for offset in 0..=PRELOAD_RADIUS {
-            for idx in [
-                self.current_page.checked_sub(offset),
-                self.current_page.checked_add(offset),
-            ] {
-                let Some(idx) = idx else { continue };
-                if idx >= len || self.cache.contains_key(&idx) || self.pending.contains(&idx) {
-                    continue;
+        let (ahead, behind) = if self.nav_dir < 0 {
+            (PRELOAD_NEAR, PRELOAD_FAR)
+        } else {
+            (PRELOAD_FAR, PRELOAD_NEAR)
+        };
+
+        let mut order = vec![self.current_page];
+        for step in 1..=ahead.max(behind) {
+            if step <= ahead {
+                if let Some(idx) = self.current_page.checked_add(step) {
+                    order.push(idx);
                 }
-                self.pending.insert(idx);
-                tasks.push(decode_task(idx, self.sources[idx].clone()));
             }
+            if step <= behind {
+                if let Some(idx) = self.current_page.checked_sub(step) {
+                    order.push(idx);
+                }
+            }
+        }
+
+        let mut tasks = Vec::new();
+        for idx in order {
+            if idx >= len || self.cache.contains_key(&idx) || self.pending.contains(&idx) {
+                continue;
+            }
+            self.pending.insert(idx);
+            tasks.push(decode_task(idx, self.sources[idx].clone()));
         }
         Task::batch(tasks)
     }
@@ -338,6 +528,15 @@ impl App {
 
     fn handle(&self, idx: usize) -> Option<&widget::image::Handle> {
         self.cache.get(&idx).map(|(h, _)| h)
+    }
+
+    /// The closest already-decoded page to `current_page`, used as a dimmed
+    /// placeholder while the actual page is still decoding.
+    fn nearest_cached_handle(&self) -> Option<&widget::image::Handle> {
+        self.cache
+            .iter()
+            .min_by_key(|(&idx, _)| idx.abs_diff(self.current_page))
+            .map(|(_, (h, _))| h)
     }
 
     fn page_data(&self, idx: usize) -> Option<Arc<comic::Page>> {
@@ -436,6 +635,11 @@ impl Application for App {
 
     fn init(core: Core, flags: Self::Flags) -> (Self, Task<Self::Message>) {
         let db = library::open_db().ok();
+        let settings = Settings::load();
+        let library_dirs: Vec<PathBuf> = db
+            .as_ref()
+            .map(|db| library::list_library_dirs(db).into_iter().map(PathBuf::from).collect())
+            .unwrap_or_default();
 
         let mut app = App {
             core,
@@ -447,14 +651,14 @@ impl Application for App {
             cache: HashMap::new(),
             pending: HashSet::new(),
             current_page: 0,
+            nav_dir: 0,
             loading: flags.is_some(),
             error: None,
             fullscreen: false,
-            theater_mode: false,
-            layout: Layout::Single,
+            theater_mode: settings.theater_mode,
+            layout: if settings.dual_page { Layout::Dual } else { Layout::Single },
             zoom_active: false,
             zoom: 1.0,
-            show_info: false,
             show_chapter_select: false,
             metadata: None,
             metadata_loading: false,
@@ -474,6 +678,9 @@ impl Application for App {
             library_entries: Vec::new(),
             library_search: String::new(),
             library_covers: HashMap::new(),
+            library_dirs: library_dirs.clone(),
+            settings,
+            context_page: ContextPage::Settings,
         };
         app.set_header_title("Cosmic Comic".into());
 
@@ -489,7 +696,35 @@ impl Application for App {
             tasks.push(app.reload_library());
         }
 
+        for dir in library_dirs {
+            for entry in discover_library_entries(&dir) {
+                tasks.push(scan_entry_task(entry));
+            }
+        }
+
         (app, Task::batch(tasks))
+    }
+
+    fn context_drawer(&self) -> Option<cosmic::app::context_drawer::ContextDrawer<'_, Message>> {
+        if !self.core.window.show_context {
+            return None;
+        }
+        Some(match self.context_page {
+            ContextPage::Settings => cosmic::app::context_drawer::context_drawer(
+                self.build_settings_panel(),
+                Message::CloseContext,
+            )
+            .title("Settings"),
+            ContextPage::Info => cosmic::app::context_drawer::context_drawer(
+                if self.epub_book.is_some() {
+                    self.build_epub_info_panel()
+                } else {
+                    self.build_info_panel()
+                },
+                Message::CloseContext,
+            )
+            .title("Details"),
+        })
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
@@ -519,8 +754,18 @@ impl Application for App {
                         .into(),
                 );
                 els.push(
-                    widget::button::suggested("Add Series")
+                    widget::button::standard("Add Series")
                         .on_press(Message::OpenFolder)
+                        .into(),
+                );
+                els.push(
+                    widget::button::suggested("Add Library Folder")
+                        .on_press(Message::AddLibraryFolder)
+                        .into(),
+                );
+                els.push(
+                    widget::button::icon(icon::from_name("emblem-system-symbolic"))
+                        .on_press(Message::ToggleSettings)
                         .into(),
                 );
             }
@@ -549,23 +794,7 @@ impl Application for App {
                             .into(),
                     );
                 }
-                els.push(
-                    widget::button::icon(icon::from_name("dialog-information-symbolic"))
-                        .on_press(Message::ToggleInfo)
-                        .into(),
-                );
-                els.push(widget::divider::vertical::light().into());
-
-                let theater_label = if self.theater_mode { "Theater: On" } else { "Theater: Off" };
-                els.push(widget::button::standard(theater_label).on_press(Message::ToggleTheater).into());
-                let fs_icon = if self.fullscreen {
-                    icon::from_name("view-restore-symbolic")
-                } else {
-                    icon::from_name("view-fullscreen-symbolic")
-                };
-                els.push(widget::button::icon(fs_icon).on_press(Message::ToggleFullscreen).into());
-                els.push(widget::divider::vertical::light().into());
-                els.push(widget::button::standard("Open").on_press(Message::OpenFile).into());
+                els.extend(self.reader_common_controls());
             }
             AppView::Reader => {
                 if !self.sources.is_empty() {
@@ -595,75 +824,31 @@ impl Application for App {
 
                     // Chapter select (only for multi-chapter series)
                     if self.chapters.len() > 1 {
-                        let ch_label = if self.show_chapter_select { "Chapters ▾" } else { "Chapters" };
                         els.push(
-                            widget::button::standard(ch_label)
+                            widget::button::icon(icon::from_name("view-list-symbolic"))
                                 .on_press(Message::ToggleChapterSelect)
                                 .into(),
                         );
                     }
-
-                    let layout_label = match self.layout {
-                        Layout::Single => "1 Page",
-                        Layout::Dual => "2 Pages",
-                    };
                     els.push(
-                        widget::button::standard(layout_label)
+                        widget::button::icon(icon::from_name("view-dual-symbolic"))
                             .on_press(Message::ToggleLayout)
                             .into(),
                     );
-
-                    let zoom_label = if self.zoom_active {
-                        format!("Zoom {:.0}%", self.zoom * 100.0)
-                    } else {
-                        "Zoom: Off".to_string()
-                    };
                     els.push(
-                        widget::button::standard(zoom_label)
+                        widget::button::icon(icon::from_name("zoom-in-symbolic"))
                             .on_press(Message::ToggleZoom)
                             .into(),
                     );
-
                     els.push(
                         widget::button::icon(icon::from_name("edit-copy-symbolic"))
                             .on_press(Message::CopyPage)
                             .into(),
                     );
-                    els.push(
-                        widget::button::icon(icon::from_name("dialog-information-symbolic"))
-                            .on_press(Message::ToggleInfo)
-                            .into(),
-                    );
                     els.push(widget::divider::vertical::light().into());
                 }
 
-                let theater_label = if self.theater_mode { "Theater: On" } else { "Theater: Off" };
-                els.push(
-                    widget::button::standard(theater_label)
-                        .on_press(Message::ToggleTheater)
-                        .into(),
-                );
-                let fs_icon = if self.fullscreen {
-                    icon::from_name("view-restore-symbolic")
-                } else {
-                    icon::from_name("view-fullscreen-symbolic")
-                };
-                els.push(
-                    widget::button::icon(fs_icon)
-                        .on_press(Message::ToggleFullscreen)
-                        .into(),
-                );
-                els.push(widget::divider::vertical::light().into());
-                els.push(
-                    widget::button::standard("Open")
-                        .on_press(Message::OpenFile)
-                        .into(),
-                );
-                els.push(
-                    widget::button::standard("Open Series")
-                        .on_press(Message::OpenFolder)
-                        .into(),
-                );
+                els.extend(self.reader_common_controls());
             }
         }
         els
@@ -706,7 +891,7 @@ impl Application for App {
             Message::GoToLibrary => {
                 self.app_view = AppView::Library;
                 self.show_chapter_select = false;
-                self.show_info = false;
+
                 self.set_header_title("Cosmic Comic — Library".into());
                 return self.reload_library();
             }
@@ -810,11 +995,13 @@ impl Application for App {
                     0
                 };
                 self.current_page = saved_page;
+                self.nav_dir = 1;
 
                 // Update library DB
                 if let Some(db) = &self.db {
                     let title = metadata::extract_title(&self.title);
-                    let _ = library::upsert_series(db, &path_str, &title, total);
+                    let _ = library::upsert_series(db, &path_str, &title, total, path.is_dir());
+                    let _ = library::touch_opened(db, &path_str);
                 }
 
                 let raw_name = self.title.clone();
@@ -836,13 +1023,14 @@ impl Application for App {
                 };
                 self.comic_info = comic_info;
 
-                self.comicvine_loading = true;
-
-                let mut tasks = vec![
-                    self.refresh_window(),
-                    metadata_task(raw_name),
-                    comicvine_task(cv_series, cv_issue, cv_year),
-                ];
+                let mut tasks = vec![self.refresh_window()];
+                if self.settings.fetch_metadata {
+                    self.comicvine_loading = true;
+                    tasks.push(metadata_task(raw_name));
+                    tasks.push(comicvine_task(cv_series, cv_issue, cv_year));
+                } else {
+                    self.metadata_loading = false;
+                }
                 if let Some(id) = self.core.main_window_id() {
                     tasks.push(self.set_window_title(self.title.clone(), id));
                 }
@@ -889,7 +1077,8 @@ impl Application for App {
                         self.epub_book = Some(book);
 
                         if let Some(db) = &self.db {
-                            let _ = library::upsert_series(db, &path_str, &self.title, chapter_count);
+                            let _ = library::upsert_series(db, &path_str, &self.title, chapter_count, false);
+                            let _ = library::touch_opened(db, &path_str);
                         }
 
                         if let Some(id) = self.core.main_window_id() {
@@ -964,6 +1153,93 @@ impl Application for App {
                 let handle = widget::image::Handle::from_path(path);
                 self.library_covers.insert(series_id, handle);
             }
+            Message::AddLibraryFolder => {
+                return cosmic::task::future(async move {
+                    let dialog = file_chooser::open::Dialog::new().title("Add Library Folder");
+                    match dialog.open_folder().await {
+                        Ok(r) => Message::LibraryFolderSelected(r.url().to_owned()),
+                        Err(file_chooser::Error::Cancelled) => Message::Cancelled,
+                        Err(e) => Message::LoadFailed(e.to_string()),
+                    }
+                });
+            }
+            Message::LibraryFolderSelected(url) => {
+                let path = match url.scheme() {
+                    "file" => match url.to_file_path() {
+                        Ok(p) => p,
+                        Err(()) => {
+                            self.error = Some(format!("invalid folder path: {url}"));
+                            return Task::none();
+                        }
+                    },
+                    other => {
+                        self.error = Some(format!("unsupported scheme: {other}"));
+                        return Task::none();
+                    }
+                };
+                if let Some(db) = &self.db {
+                    let _ = library::add_library_dir(db, &path.to_string_lossy());
+                }
+                if !self.library_dirs.contains(&path) {
+                    self.library_dirs.push(path.clone());
+                }
+                let mut tasks = Vec::new();
+                for entry in discover_library_entries(&path) {
+                    tasks.push(scan_entry_task(entry));
+                }
+                return Task::batch(tasks);
+            }
+            Message::LibraryEntryScanned(result) => {
+                let Ok(outcome) = result else { return Task::none() };
+                if let Some(db) = &self.db {
+                    let path_str = outcome.path.to_string_lossy().to_string();
+                    let _ = library::upsert_series(
+                        db, &path_str, &outcome.title, outcome.count, outcome.is_series,
+                    );
+                }
+                let cover_path = library::chapter_cover_path(&outcome.path.to_string_lossy(), 0);
+                if !cover_path.exists() {
+                    if let Some(bytes) = outcome.epub_cover {
+                        return epub_library_cover_task(bytes, outcome.path);
+                    } else if let Some(source) = outcome.first_page {
+                        return comic_library_cover_task(source, outcome.path);
+                    }
+                }
+                return self.reload_library();
+            }
+            Message::LibraryScanCoverDone(_) => {
+                return self.reload_library();
+            }
+            Message::RemoveLibraryFolder(path) => {
+                if let Some(db) = &self.db {
+                    let _ = library::remove_library_dir(db, &path.to_string_lossy());
+                }
+                self.library_dirs.retain(|d| d != &path);
+                return self.reload_library();
+            }
+            Message::ToggleSettings => {
+                let showing_settings =
+                    self.core.window.show_context && self.context_page == ContextPage::Settings;
+                self.context_page = ContextPage::Settings;
+                self.set_show_context(!showing_settings);
+            }
+            Message::CloseContext => {
+                self.set_show_context(false);
+            }
+            Message::SetBackgroundOpacity(value) => {
+                self.settings.background_opacity = value.clamp(0.0, 1.0);
+                self.settings.save();
+            }
+            Message::SetBackground(idx) => {
+                if let Some(bg) = BgStyle::ALL.get(idx).copied() {
+                    self.settings.background = bg;
+                    self.settings.save();
+                }
+            }
+            Message::SetFetchMetadata(enabled) => {
+                self.settings.fetch_metadata = enabled;
+                self.settings.save();
+            }
             Message::NextPage => {
                 if let Some(book) = &self.epub_book {
                     let new = (self.epub_chapter + 1).min(book.chapters.len().saturating_sub(1));
@@ -977,6 +1253,7 @@ impl Application for App {
                 let new = (self.current_page + step).min(self.sources.len().saturating_sub(1));
                 if new != self.current_page {
                     self.current_page = new;
+                    self.nav_dir = 1;
                     self.persist_progress();
                     return self.refresh_window();
                 }
@@ -994,6 +1271,7 @@ impl Application for App {
                 let new = self.current_page.saturating_sub(step);
                 if new != self.current_page {
                     self.current_page = new;
+                    self.nav_dir = -1;
                     self.persist_progress();
                     return self.refresh_window();
                 }
@@ -1005,9 +1283,15 @@ impl Application for App {
                     return window::set_mode(id, mode);
                 }
             }
-            Message::ToggleTheater => { self.theater_mode = !self.theater_mode; }
+            Message::ToggleTheater => {
+                self.theater_mode = !self.theater_mode;
+                self.settings.theater_mode = self.theater_mode;
+                self.settings.save();
+            }
             Message::ToggleLayout => {
                 self.layout = match self.layout { Layout::Single => Layout::Dual, Layout::Dual => Layout::Single };
+                self.settings.dual_page = self.layout == Layout::Dual;
+                self.settings.save();
                 if self.layout == Layout::Dual && self.current_page % 2 != 0 {
                     self.current_page = self.current_page.saturating_sub(1);
                 }
@@ -1018,13 +1302,18 @@ impl Application for App {
                 self.zoom = 1.0;
             }
             Message::ToggleInfo => {
-                self.show_info = !self.show_info;
-                if self.show_info { self.show_chapter_select = false; }
+                let showing_info =
+                    self.core.window.show_context && self.context_page == ContextPage::Info;
+                self.context_page = ContextPage::Info;
+                self.set_show_context(!showing_info);
+                if !showing_info {
+                    self.show_chapter_select = false;
+                }
             }
             Message::ToggleChapterSelect => {
                 self.show_chapter_select = !self.show_chapter_select;
                 if self.show_chapter_select {
-                    self.show_info = false;
+
                     return self.queue_missing_covers();
                 }
             }
@@ -1035,6 +1324,7 @@ impl Application for App {
                     self.persist_progress();
                 } else if let Some(ch) = self.chapters.get(ch_idx) {
                     self.current_page = ch.start;
+                    self.nav_dir = 1;
                     self.show_chapter_select = false;
                     self.persist_progress();
                     return self.refresh_window();
@@ -1151,14 +1441,11 @@ impl App {
                     return self.refresh_window();
                 }
                 "m" | "M" => { self.zoom_active = !self.zoom_active; self.zoom = 1.0; }
-                "i" | "I" => {
-                    self.show_info = !self.show_info;
-                    if self.show_info { self.show_chapter_select = false; }
-                }
+                "i" | "I" => return self.update(Message::ToggleInfo),
+                "s" | "S" => return self.update(Message::ToggleSettings),
                 "c" | "C" if self.chapters.len() > 1 => {
                     self.show_chapter_select = !self.show_chapter_select;
                     if self.show_chapter_select {
-                        self.show_info = false;
                         return self.queue_missing_covers();
                     }
                 }
@@ -1219,26 +1506,57 @@ impl App {
                             .push(widget::button::suggested("Add Series").on_press(Message::OpenFolder)),
                     ),
             );
-        } else {
+        } else if self.library_dirs.is_empty() {
             col = col.push(widget::text::title3("All Series"));
-            // 5-column grid
-            let mut grid_col = widget::Column::new().spacing(12);
-            for chunk in self.library_entries.chunks(5) {
-                let mut row = widget::Row::new().spacing(12);
-                for entry in chunk {
-                    row = row.push(self.series_card(entry, false));
-                }
-                grid_col = grid_col.push(row);
-            }
             col = col.push(
-                widget::scrollable::scrollable(grid_col).height(Length::Fill),
+                widget::scrollable::scrollable(self.series_grid(&self.library_entries.iter().collect::<Vec<_>>()))
+                    .height(Length::Fill),
             );
+        } else {
+            // Grouped by configured library folder, with anything opened
+            // outside of those (loose "Open File"/"Add Series" picks)
+            // collected in a trailing "Library" section.
+            let mut grouped = widget::Column::new().spacing(20);
+            let mut remaining: Vec<&SeriesEntry> = self.library_entries.iter().collect();
+
+            for dir in &self.library_dirs {
+                let (matched, rest): (Vec<_>, Vec<_>) =
+                    remaining.into_iter().partition(|e| Path::new(&e.path).starts_with(dir));
+                remaining = rest;
+                if matched.is_empty() {
+                    continue;
+                }
+                let name = dir.file_name().map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+                grouped = grouped
+                    .push(widget::text::title3(name))
+                    .push(self.series_grid(&matched));
+            }
+
+            if !remaining.is_empty() {
+                grouped = grouped.push(widget::text::title3("Library")).push(self.series_grid(&remaining));
+            }
+
+            col = col.push(widget::scrollable::scrollable(grouped).height(Length::Fill));
         }
 
         widget::container(col)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// A 5-column grid of series cards.
+    fn series_grid<'a>(&'a self, entries: &[&'a SeriesEntry]) -> Element<'a, Message> {
+        let mut grid_col = widget::Column::new().spacing(12);
+        for chunk in entries.chunks(5) {
+            let mut row = widget::Row::new().spacing(12);
+            for entry in chunk {
+                row = row.push(self.series_card(entry, false));
+            }
+            grid_col = grid_col.push(row);
+        }
+        grid_col.into()
     }
 
     fn series_card<'a>(&'a self, entry: &'a SeriesEntry, show_progress: bool) -> Element<'a, Message> {
@@ -1275,7 +1593,7 @@ impl App {
             card = card.push(
                 cosmic::iced::widget::ProgressBar::new(0.0..=1.0, fraction),
             );
-            let ch = if entry.last_read_chapter > 0 {
+            let ch = if entry.is_series {
                 format!("Ch.{}", entry.last_read_chapter + 1)
             } else {
                 format!("P.{}", entry.last_read_page + 1)
@@ -1355,16 +1673,41 @@ impl App {
                         row.into()
                     }
                 }
-            } else if self.loading || !self.sources.is_empty() {
+            } else if !self.sources.is_empty() {
+                // A page is still decoding — show the nearest already-decoded
+                // page dimmed underneath the spinner instead of a blank
+                // screen, so something is visible immediately while the
+                // real page loads in.
+                let spinner = widget::container(
+                    widget::Column::new()
+                        .spacing(12)
+                        .align_x(Alignment::Center)
+                        .push(widget::indeterminate_circular())
+                        .push(widget::text("Decoding page…")),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill);
+
+                match self.nearest_cached_handle() {
+                    Some(h) => cosmic::iced::widget::stack![
+                        widget::image(h.clone())
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .content_fit(ContentFit::Contain)
+                            .opacity(0.35),
+                        spinner,
+                    ]
+                    .into(),
+                    None => spinner.into(),
+                }
+            } else if self.loading {
                 widget::Column::new()
                     .spacing(12)
                     .align_x(Alignment::Center)
                     .push(widget::indeterminate_circular())
-                    .push(widget::text(if self.sources.is_empty() {
-                        "Loading comic…"
-                    } else {
-                        "Decoding page…"
-                    }))
+                    .push(widget::text("Loading comic…"))
                     .into()
             } else {
                 widget::Column::new()
@@ -1380,28 +1723,10 @@ impl App {
                     .into()
             };
 
-        // ── Theater background ────────────────────────────────────────────────
-        let viewer_bg: Element<'_, Message> = if self.theater_mode {
-            widget::container(viewer)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .style(|_: &cosmic::Theme| widget::container::Style {
-                    background: Some(Background::Color(Color::BLACK)),
-                    ..Default::default()
-                })
-                .into()
-        } else {
-            widget::container(viewer)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .into()
-        };
+        // ── Backdrop (never tints the page itself) ────────────────────────────
+        let viewer_bg: Element<'_, Message> = self.backdrop(viewer);
 
-        // ── Right panel (chapter select or info) ──────────────────────────────
+        // ── Right panel (chapter select; Info lives in the context drawer) ────
         let main_row: Element<'_, Message> = if self.show_chapter_select {
             widget::Row::new()
                 .push(
@@ -1410,15 +1735,6 @@ impl App {
                         .height(Length::Fill),
                 )
                 .push(self.build_chapter_select())
-                .into()
-        } else if self.show_info {
-            widget::Row::new()
-                .push(
-                    widget::container(viewer_bg)
-                        .width(Length::Fill)
-                        .height(Length::Fill),
-                )
-                .push(self.build_info_panel())
                 .into()
         } else {
             viewer_bg
@@ -1450,28 +1766,12 @@ impl App {
             widget::text("This book has no chapters.").into()
         };
 
-        let content_bg: Element<'_, Message> = if self.theater_mode {
-            widget::container(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_: &cosmic::Theme| widget::container::Style {
-                    background: Some(Background::Color(Color::BLACK)),
-                    ..Default::default()
-                })
-                .into()
-        } else {
-            widget::container(content).width(Length::Fill).height(Length::Fill).into()
-        };
+        let content_bg: Element<'_, Message> = self.backdrop(content);
 
         let main_row: Element<'_, Message> = if self.show_chapter_select {
             widget::Row::new()
                 .push(widget::container(content_bg).width(Length::Fill).height(Length::Fill))
                 .push(self.build_epub_chapter_select())
-                .into()
-        } else if self.show_info {
-            widget::Row::new()
-                .push(widget::container(content_bg).width(Length::Fill).height(Length::Fill))
-                .push(self.build_epub_info_panel())
                 .into()
         } else {
             content_bg
@@ -1646,6 +1946,125 @@ impl App {
             .width(Length::Fixed(300.0))
             .height(Length::Fill)
             .into()
+    }
+
+    /// Wraps reader content in the configured backdrop. Only the area
+    /// *around* the page is tinted — the page image itself is a child of
+    /// this container and is never affected by the opacity setting.
+    fn backdrop<'a>(&self, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+        let black = self.theater_mode || self.settings.background == BgStyle::Black;
+        let alpha = self.settings.background_opacity.clamp(0.0, 1.0);
+
+        widget::container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(move |theme: &cosmic::Theme| {
+                let base = if black {
+                    Color::BLACK
+                } else {
+                    theme.cosmic().bg_color().into()
+                };
+                widget::container::Style {
+                    background: Some(Background::Color(Color { a: alpha, ..base })),
+                    ..Default::default()
+                }
+            })
+            .into()
+    }
+
+    /// Controls shared by both reader modes, kept to compact icon buttons —
+    /// everything with a persistent preference now lives in the settings
+    /// drawer instead of the header bar.
+    fn reader_common_controls(&self) -> Vec<Element<'_, Message>> {
+        let fs_icon = if self.fullscreen {
+            icon::from_name("view-restore-symbolic")
+        } else {
+            icon::from_name("view-fullscreen-symbolic")
+        };
+        vec![
+            widget::button::icon(icon::from_name("dialog-information-symbolic"))
+                .on_press(Message::ToggleInfo)
+                .into(),
+            widget::button::icon(fs_icon).on_press(Message::ToggleFullscreen).into(),
+            widget::button::icon(icon::from_name("emblem-system-symbolic"))
+                .on_press(Message::ToggleSettings)
+                .into(),
+            widget::divider::vertical::light().into(),
+            widget::button::icon(icon::from_name("document-open-symbolic"))
+                .on_press(Message::OpenFile)
+                .into(),
+        ]
+    }
+
+    fn build_settings_panel(&self) -> Element<'_, Message> {
+        let s = &self.settings;
+
+        let appearance = widget::settings::section()
+            .title("Appearance")
+            .add(widget::settings::item(
+                "Background",
+                widget::dropdown(
+                    &BG_LABELS[..],
+                    BgStyle::ALL.iter().position(|b| *b == s.background),
+                    Message::SetBackground,
+                ),
+            ))
+            .add(widget::settings::item(
+                format!("Background opacity  ({:.0}%)", s.background_opacity * 100.0),
+                widget::slider(0.0..=1.0, s.background_opacity, Message::SetBackgroundOpacity)
+                    .step(0.05)
+                    .width(Length::Fixed(180.0)),
+            ))
+            .add(widget::settings::item(
+                "Theater mode",
+                widget::toggler(self.theater_mode).on_toggle(|_| Message::ToggleTheater),
+            ));
+
+        let reading = widget::settings::section()
+            .title("Reading")
+            .add(widget::settings::item(
+                "Two-page spread",
+                widget::toggler(self.layout == Layout::Dual)
+                    .on_toggle(|_| Message::ToggleLayout),
+            ))
+            .add(widget::settings::item(
+                "Look up metadata online",
+                widget::toggler(s.fetch_metadata).on_toggle(Message::SetFetchMetadata),
+            ));
+
+        let mut library_section = widget::settings::section().title("Library folders");
+        if self.library_dirs.is_empty() {
+            library_section = library_section.add(
+                widget::text("No library folders yet. Add one to have its comics scanned in automatically.")
+                    .size(12),
+            );
+        } else {
+            for dir in &self.library_dirs {
+                let name = dir.to_string_lossy().into_owned();
+                library_section = library_section.add(
+                    widget::Row::new()
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .push(widget::text(name).size(12).width(Length::Fill))
+                        .push(
+                            widget::button::icon(icon::from_name("user-trash-symbolic"))
+                                .on_press(Message::RemoveLibraryFolder(dir.clone())),
+                        ),
+                );
+            }
+        }
+
+        widget::settings::view_column(vec![
+            appearance.into(),
+            reading.into(),
+            library_section.into(),
+            widget::button::standard("Add Library Folder")
+                .on_press(Message::AddLibraryFolder)
+                .into(),
+        ])
+        .into()
     }
 
     fn build_info_panel(&self) -> Element<'_, Message> {
