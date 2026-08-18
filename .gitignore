@@ -1,1 +1,10 @@
 /target
+Cargo.lock.bak
+*.db
+*.db-wal
+*.db-shm
+*.log
+.DS_Store
+*.swp
+/scratch/
+/tmp/
