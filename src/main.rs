@@ -1,6 +1,8 @@
 mod app;
 mod comic;
+mod comicinfo;
 mod comicvine;
+mod epub;
 mod library;
 mod metadata;
 

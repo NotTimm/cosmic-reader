@@ -13,27 +13,47 @@ pub struct ComicVineMatch {
     pub cover_date: Option<String>,
     pub description: Option<String>,
     pub site_url: Option<String>,
+    pub cover_url: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct SearchResponse {
+struct SearchResponse<T> {
     error: String,
-    results: Vec<SearchResult>,
+    results: Vec<T>,
 }
 
 #[derive(Deserialize)]
-struct SearchResult {
+struct VolumeResult {
+    id: u64,
+    name: Option<String>,
+    start_year: Option<String>,
+    publisher: Option<PublisherRef>,
+}
+
+#[derive(Deserialize)]
+struct PublisherRef {
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IssueResult {
     name: Option<String>,
     issue_number: Option<String>,
     cover_date: Option<String>,
     description: Option<String>,
     site_detail_url: Option<String>,
-    volume: Option<VolumeRef>,
+    volume: Option<VolumeNameRef>,
+    image: Option<ImageRef>,
 }
 
 #[derive(Deserialize)]
-struct VolumeRef {
+struct VolumeNameRef {
     name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImageRef {
+    medium_url: Option<String>,
 }
 
 /// Reads the ComicVine API key from `COMICVINE_API_KEY`, falling back to
@@ -53,8 +73,43 @@ pub fn api_key() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Searches ComicVine for a single issue matching `query` (e.g. "Civil War #1").
-pub async fn search_issue(query: &str) -> Result<ComicVineMatch, String> {
+fn client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("cosmic-comic/0.1 (+https://github.com/NotTimm/cosmic-reader)")
+        .build()
+        .map_err(|e| format!("http client error: {e}"))
+}
+
+/// Rough case/whitespace-insensitive similarity in `[0, 1]`, `1.0` being an
+/// exact match. Good enough to rank ComicVine's already-relevance-sorted
+/// volume search results without pulling in a fuzzy-matching crate.
+fn similarity(a: &str, b: &str) -> f32 {
+    let a = a.trim().to_lowercase();
+    let b = b.trim().to_lowercase();
+    if a == b {
+        return 1.0;
+    }
+    if a.contains(&b) || b.contains(&a) {
+        return 0.75;
+    }
+    let a_words: std::collections::HashSet<&str> = a.split_whitespace().collect();
+    let b_words: std::collections::HashSet<&str> = b.split_whitespace().collect();
+    let overlap = a_words.intersection(&b_words).count();
+    let union = a_words.union(&b_words).count().max(1);
+    0.5 * (overlap as f32 / union as f32)
+}
+
+/// Finds the single issue matching `series`/`issue_number`/`year`, the way
+/// Jellyfin's ComicVine plugin does it: search volumes (series) first, pick
+/// the best-matching one, then look up the specific issue inside it — far
+/// more reliable than a single blended free-text issue search, especially
+/// for long-running or rebooted series that share a name.
+pub async fn find_issue(
+    series: &str,
+    issue_number: Option<&str>,
+    year: Option<u32>,
+) -> Result<ComicVineMatch, String> {
     let Some(key) = api_key() else {
         return Err(
             "no ComicVine API key set — set COMICVINE_API_KEY or write one to \
@@ -62,46 +117,121 @@ pub async fn search_issue(query: &str) -> Result<ComicVineMatch, String> {
                 .to_string(),
         );
     };
+    let client = client()?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("cosmic-comic/0.1 (+https://github.com/NotTimm/cosmic-reader)")
-        .build()
-        .map_err(|e| format!("http client error: {e}"))?;
-
-    let resp = client
+    let volumes: SearchResponse<VolumeResult> = client
         .get("https://comicvine.gamespot.com/api/search/")
         .query(&[
             ("api_key", key.as_str()),
             ("format", "json"),
-            ("resources", "issue"),
-            ("query", query),
-            ("limit", "1"),
-            ("field_list", "name,issue_number,cover_date,description,site_detail_url,volume"),
+            ("resources", "volume"),
+            ("query", series),
+            ("limit", "10"),
+            ("field_list", "id,name,start_year,publisher"),
         ])
         .send()
         .await
         .map_err(|e| format!("network error: {e}"))?
-        .json::<SearchResponse>()
+        .json()
         .await
         .map_err(|e| format!("parse error: {e}"))?;
 
-    if resp.error != "OK" {
-        return Err(format!("ComicVine error: {}", resp.error));
+    if volumes.error != "OK" {
+        return Err(format!("ComicVine error: {}", volumes.error));
     }
 
-    let first = resp
+    let best_volume = volumes
         .results
         .into_iter()
-        .next()
-        .ok_or_else(|| format!("no ComicVine results for '{query}'"))?;
+        .max_by(|a, b| {
+            score_volume(a, series, year)
+                .total_cmp(&score_volume(b, series, year))
+        })
+        .ok_or_else(|| format!("no ComicVine volumes found for '{series}'"))?;
+
+    let volume_name = best_volume.name.clone().unwrap_or_default();
+
+    // No issue number to narrow by — best we can do is describe the volume.
+    let Some(issue_number) = issue_number else {
+        return Ok(ComicVineMatch {
+            name: volume_name.clone(),
+            volume: Some(volume_name),
+            issue_number: None,
+            cover_date: best_volume.start_year.clone(),
+            description: None,
+            site_url: None,
+            cover_url: None,
+        });
+    };
+
+    let filter = format!("volume:{},issue_number:{issue_number}", best_volume.id);
+    let issues: SearchResponse<IssueResult> = client
+        .get("https://comicvine.gamespot.com/api/issues/")
+        .query(&[
+            ("api_key", key.as_str()),
+            ("format", "json"),
+            ("filter", filter.as_str()),
+            ("field_list", "name,issue_number,cover_date,description,site_detail_url,volume,image"),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("parse error: {e}"))?;
+
+    if issues.error != "OK" {
+        return Err(format!("ComicVine error: {}", issues.error));
+    }
+
+    let issue = issues.results.into_iter().next().ok_or_else(|| {
+        format!("found volume '{volume_name}' but no issue #{issue_number} in it")
+    })?;
 
     Ok(ComicVineMatch {
-        name: first.name.unwrap_or_default(),
-        volume: first.volume.and_then(|v| v.name),
-        issue_number: first.issue_number,
-        cover_date: first.cover_date,
-        description: first.description.map(|d| strip_html(&d)),
-        site_url: first.site_detail_url,
+        name: issue.name.unwrap_or_else(|| volume_name.clone()),
+        volume: issue.volume.and_then(|v| v.name).or(Some(volume_name)),
+        issue_number: issue.issue_number,
+        cover_date: issue.cover_date,
+        description: issue.description.map(|d| strip_html(&d)),
+        site_url: issue.site_detail_url,
+        cover_url: issue.image.and_then(|i| i.medium_url),
     })
+}
+
+fn score_volume(v: &VolumeResult, series: &str, year: Option<u32>) -> f32 {
+    let mut score = v.name.as_deref().map(|n| similarity(n, series)).unwrap_or(0.0);
+    if let (Some(target), Some(start)) = (year, v.start_year.as_deref().and_then(|s| s.parse::<u32>().ok())) {
+        let diff = target.abs_diff(start);
+        // Small bonus for a close/matching start year, tapering off over a
+        // decade — publication runs often span years, so this is a nudge,
+        // not a hard filter.
+        score += (1.0 - (diff as f32 / 10.0).min(1.0)) * 0.2;
+    }
+    if let Some(publisher) = v.publisher.as_ref().and_then(|p| p.name.as_deref()) {
+        // Marvel/DC events and long runs are common enough to nudge toward.
+        if matches!(publisher, "Marvel" | "DC Comics") {
+            score += 0.05;
+        }
+    }
+    score
+}
+
+/// Downloads and decodes a ComicVine cover image URL to raw RGBA.
+pub async fn fetch_cover(url: &str) -> Result<(u32, u32, Vec<u8>), String> {
+    let client = client()?;
+    let bytes = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("download error: {e}"))?;
+
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| format!("failed to decode cover: {e}"))?
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    Ok((w, h, img.into_raw()))
 }

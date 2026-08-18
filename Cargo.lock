@@ -1037,6 +1037,7 @@ dependencies = [
  "env_logger",
  "image",
  "libcosmic",
+ "quick-xml 0.37.5",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1049,7 +1050,7 @@ dependencies = [
 [[package]]
 name = "cosmic-config"
 version = "1.0.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "atomicwrites",
  "cosmic-config-derive",
@@ -1070,7 +1071,7 @@ dependencies = [
 [[package]]
 name = "cosmic-config-derive"
 version = "1.0.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "quote",
  "syn",
@@ -1139,7 +1140,7 @@ dependencies = [
 [[package]]
 name = "cosmic-theme"
 version = "1.0.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "almost",
  "configparser",
@@ -2457,7 +2458,7 @@ dependencies = [
 [[package]]
 name = "iced"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "dnd",
  "iced_accessibility",
@@ -2478,7 +2479,7 @@ dependencies = [
 [[package]]
 name = "iced_accessibility"
 version = "0.1.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -2487,7 +2488,7 @@ dependencies = [
 [[package]]
 name = "iced_core"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "bitflags 2.13.0",
  "bytes",
@@ -2512,7 +2513,7 @@ dependencies = [
 [[package]]
 name = "iced_debug"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "iced_core",
  "iced_futures",
@@ -2522,7 +2523,7 @@ dependencies = [
 [[package]]
 name = "iced_futures"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "futures",
  "iced_core",
@@ -2536,7 +2537,7 @@ dependencies = [
 [[package]]
 name = "iced_graphics"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",
@@ -2557,7 +2558,7 @@ dependencies = [
 [[package]]
 name = "iced_program"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "iced_graphics",
  "iced_runtime",
@@ -2566,7 +2567,7 @@ dependencies = [
 [[package]]
 name = "iced_renderer"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "iced_graphics",
  "iced_tiny_skia",
@@ -2578,7 +2579,7 @@ dependencies = [
 [[package]]
 name = "iced_runtime"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "bytes",
  "cosmic-client-toolkit",
@@ -2593,7 +2594,7 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -2610,7 +2611,7 @@ dependencies = [
 [[package]]
 name = "iced_wgpu"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "as-raw-xcb-connection",
  "bitflags 2.13.0",
@@ -2641,7 +2642,7 @@ dependencies = [
 [[package]]
 name = "iced_widget"
 version = "0.14.2"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "cosmic-client-toolkit",
  "dnd",
@@ -2659,7 +2660,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.14.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "cosmic-client-toolkit",
  "cursor-icon",
@@ -3124,7 +3125,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libcosmic"
 version = "1.0.0"
-source = "git+https://github.com/NotTimm/libcosmic.git?rev=b30d948887892894d86e3e9401a93ea509ebacf6#b30d948887892894d86e3e9401a93ea509ebacf6"
+source = "git+https://github.com/NotTimm/libcosmic.git?rev=b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4#b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
 dependencies = [
  "apply",
  "ashpd 0.12.3",
@@ -4323,6 +4324,15 @@ name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
+
+[[package]]
+name = "quick-xml"
+version = "0.37.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "quick-xml"
@@ -6082,7 +6092,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a"
 dependencies = [
  "proc-macro2",
- "quick-xml",
+ "quick-xml 0.39.4",
  "quote",
 ]
 
@@ -7247,7 +7257,7 @@ version = "5.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8067892e940ed1727dea64690378601603b31d62dfde019a5335fbb7c0e0ed9"
 dependencies = [
- "quick-xml",
+ "quick-xml 0.39.4",
  "serde",
  "zbus_names",
  "zvariant",

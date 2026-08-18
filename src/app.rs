@@ -8,7 +8,7 @@ use cosmic::dialog::file_chooser::{self, FileFilter};
 use cosmic::iced::{
     event,
     keyboard::{self, key::Named, Key},
-    mouse, touch, window, Alignment, Background, Color, ContentFit, Length, Point, Subscription,
+    mouse, touch, window, Alignment, Background, Color, ContentFit, Length, Subscription,
 };
 use cosmic::iced::widget::scrollable as scroll_mod;
 use cosmic::iced::widget::mouse_area;
@@ -17,19 +17,19 @@ use cosmic::{executor, Application, ApplicationExt, Element};
 use url::Url;
 
 use crate::comic::{self, ChapterInfo, PageSource};
+use crate::epub;
+use crate::comicinfo::{self, ComicInfo};
 use crate::comicvine::{self, ComicVineMatch};
 use crate::library::{self, SeriesEntry};
 use crate::metadata::{self, ParsedFilename, SeriesMetadata};
 
 const MIN_ZOOM: f32 = 0.25;
-const MAX_ZOOM: f32 = 6.0;
-const ZOOM_STEP: f32 = 1.2;
+const MAX_ZOOM: f32 = 8.0;
 
 pub const APP_ID: &str = "com.tsingel.CosmicComic";
 
 const PRELOAD_RADIUS: usize = 3;
 const CACHE_RADIUS: usize = 10;
-const PAN_STEP: f32 = 80.0;
 const THUMB_W: u32 = 120;
 const THUMB_H: u32 = 170;
 
@@ -54,6 +54,7 @@ pub enum Message {
     OpenFromLibrary { path: PathBuf, page: usize, chapter: usize },
     // Loading
     Loaded(PathBuf, Vec<PageSource>, Vec<ChapterInfo>),
+    EpubLoaded(PathBuf, Result<epub::EpubBook, String>),
     PageDecoded(usize, Result<Arc<comic::Page>, String>),
     LoadFailed(String),
     Cancelled,
@@ -75,6 +76,7 @@ pub enum Message {
     // Metadata
     MetadataLoaded(Result<SeriesMetadata, String>),
     ComicVineLoaded(Result<ComicVineMatch, String>),
+    ComicVineCoverReady(Result<(u32, u32, Vec<u8>), String>),
     // Chapter covers
     ChapterCoverReady { chapter_idx: usize, result: Result<(u32, u32, Vec<u8>), String> },
     // Library
@@ -83,8 +85,9 @@ pub enum Message {
     // Keys / pointer / touch
     Key(Key),
     ModifiersChanged(keyboard::Modifiers),
-    WheelScrolled(mouse::ScrollDelta),
-    TrackpadZoom(f32),
+    ZoomBootstrap,
+    ZoomBootstrapWheel,
+    ZoomChanged(f32),
     Touch(touch::Event),
     // Drag and drop
     FilesDropped(Vec<PathBuf>),
@@ -112,18 +115,22 @@ pub struct App {
     layout: Layout,
     zoom_active: bool,
     zoom: f32,
-    scroll_id: widget::Id,
     show_info: bool,
     show_chapter_select: bool,
     metadata: Option<SeriesMetadata>,
     metadata_loading: bool,
     parsed_filename: Option<ParsedFilename>,
+    comic_info: Option<ComicInfo>,
     comicvine: Option<Result<ComicVineMatch, String>>,
     comicvine_loading: bool,
+    comicvine_cover: Option<widget::image::Handle>,
+    // epub
+    epub_book: Option<epub::EpubBook>,
+    epub_chapter: usize,
+    epub_cover: Option<widget::image::Handle>,
     // pointer / touch state
     modifiers: keyboard::Modifiers,
-    touches: HashMap<touch::Finger, Point>,
-    pinch_last_dist: Option<f32>,
+    touches: HashSet<touch::Finger>,
     // chapter covers (decoded for the currently open series)
     chapter_covers: HashMap<usize, widget::image::Handle>,
     covers_pending: HashSet<usize>,
@@ -145,6 +152,30 @@ fn open_task(path: PathBuf) -> Task<Message> {
             Err(e) => Message::LoadFailed(format!("listing task panicked: {e}")),
         }
     })
+}
+
+fn epub_open_task(path: PathBuf) -> Task<Message> {
+    cosmic::task::future(async move {
+        let open_path = path.clone();
+        match tokio::task::spawn_blocking(move || epub::open(&open_path)).await {
+            Ok(Ok(book)) => Message::EpubLoaded(path, Ok(book)),
+            Ok(Err(e)) => Message::EpubLoaded(path, Err(e)),
+            Err(e) => Message::EpubLoaded(path, Err(format!("epub open task panicked: {e}"))),
+        }
+    })
+}
+
+/// Opens `path`, routing to the epub or comic pipeline based on extension.
+fn open_any(path: PathBuf) -> Task<Message> {
+    let is_epub = path
+        .file_name()
+        .map(|n| epub::is_epub_name(&n.to_string_lossy()))
+        .unwrap_or(false);
+    if is_epub {
+        epub_open_task(path)
+    } else {
+        open_task(path)
+    }
 }
 
 fn decode_task(index: usize, source: PageSource) -> Task<Message> {
@@ -187,14 +218,16 @@ fn metadata_task(raw_name: String) -> Task<Message> {
     })
 }
 
-fn comicvine_task(parsed: ParsedFilename) -> Task<Message> {
+fn comicvine_task(series: String, issue_number: Option<String>, year: Option<u32>) -> Task<Message> {
     cosmic::task::future(async move {
-        let query = match parsed.issue {
-            Some(n) => format!("{} #{n}", parsed.series),
-            None => parsed.series.clone(),
-        };
-        Message::ComicVineLoaded(comicvine::search_issue(&query).await)
+        Message::ComicVineLoaded(
+            comicvine::find_issue(&series, issue_number.as_deref(), year).await,
+        )
     })
+}
+
+fn comicvine_cover_task(url: String) -> Task<Message> {
+    cosmic::task::future(async move { Message::ComicVineCoverReady(comicvine::fetch_cover(&url).await) })
 }
 
 /// Decode the first page of `chapter_idx`, thumbnail it, save to disk, return rgba.
@@ -274,43 +307,32 @@ impl App {
         if self.layout == Layout::Dual { 2 } else { 1 }
     }
 
-    /// Multiplies the current zoom level by `factor`, clamped, and switches
-    /// into zoom/pan mode if not already active.
-    fn apply_zoom(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        self.zoom_active = true;
+    /// Enters zoom/pan mode (at 100%) if not already active. The actual
+    /// zoom-to-cursor math (mouse wheel, trackpad pinch, touchscreen pinch,
+    /// click-drag pan) all lives inside `widget::image::viewer`, which is
+    /// only present in the tree once zoom is active — this just handles
+    /// the very first gesture tick that switches into that widget.
+    fn enter_zoom(&mut self) {
+        if !self.zoom_active {
+            self.zoom_active = true;
+            self.zoom = 1.0;
+        }
     }
 
-    /// Tracks active touch points and turns a two-finger pinch into a zoom
-    /// change (touchscreen pinch-to-zoom).
+    /// Tracks active touch points only to detect the two-finger-down that
+    /// bootstraps zoom mode from the fit-to-window view.
     fn handle_touch(&mut self, event: touch::Event) {
         match event {
-            touch::Event::FingerPressed { id, position } => {
-                self.touches.insert(id, position);
-                if self.touches.len() != 2 {
-                    self.pinch_last_dist = None;
-                }
-            }
-            touch::Event::FingerMoved { id, position } => {
-                self.touches.insert(id, position);
+            touch::Event::FingerPressed { id, .. } => {
+                self.touches.insert(id);
                 if self.app_view == AppView::Reader && self.touches.len() == 2 {
-                    let mut pts = self.touches.values().copied();
-                    let (a, b) = (pts.next().unwrap(), pts.next().unwrap());
-                    let dist = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
-                    if let Some(prev) = self.pinch_last_dist {
-                        if prev > 1.0 {
-                            self.apply_zoom(dist / prev);
-                        }
-                    }
-                    self.pinch_last_dist = Some(dist);
+                    self.enter_zoom();
                 }
             }
             touch::Event::FingerLifted { id, .. } | touch::Event::FingerLost { id, .. } => {
                 self.touches.remove(&id);
-                if self.touches.len() < 2 {
-                    self.pinch_last_dist = None;
-                }
             }
+            touch::Event::FingerMoved { .. } => {}
         }
     }
 
@@ -366,6 +388,11 @@ impl App {
     fn persist_progress(&self) {
         let Some(db) = &self.db else { return };
         let Some(path) = &self.open_path else { return };
+        if self.epub_book.is_some() {
+            let _ =
+                library::save_progress(db, &path.to_string_lossy(), 0, self.epub_chapter);
+            return;
+        }
         let ch_idx = self.current_chapter().map(|(i, _, _)| i).unwrap_or(0);
         let _ = library::save_progress(db, &path.to_string_lossy(), self.current_page, ch_idx);
     }
@@ -427,17 +454,20 @@ impl Application for App {
             layout: Layout::Single,
             zoom_active: false,
             zoom: 1.0,
-            scroll_id: widget::Id::new("viewer"),
             show_info: false,
             show_chapter_select: false,
             metadata: None,
             metadata_loading: false,
             parsed_filename: None,
+            comic_info: None,
             comicvine: None,
             comicvine_loading: false,
+            comicvine_cover: None,
+            epub_book: None,
+            epub_chapter: 0,
+            epub_cover: None,
             modifiers: keyboard::Modifiers::default(),
-            touches: HashMap::new(),
-            pinch_last_dist: None,
+            touches: HashSet::new(),
             chapter_covers: HashMap::new(),
             covers_pending: HashSet::new(),
             db,
@@ -453,7 +483,7 @@ impl Application for App {
         }];
 
         if let Some(path) = flags {
-            tasks.push(open_task(path));
+            tasks.push(open_any(path));
         } else {
             // Start on library view — load entries
             tasks.push(app.reload_library());
@@ -493,6 +523,49 @@ impl Application for App {
                         .on_press(Message::OpenFolder)
                         .into(),
                 );
+            }
+            AppView::Reader if self.epub_book.is_some() => {
+                let book = self.epub_book.as_ref().unwrap();
+                els.push(
+                    widget::button::icon(icon::from_name("go-previous-symbolic"))
+                        .on_press(Message::PrevPage)
+                        .into(),
+                );
+                els.push(
+                    widget::text(format!("Chapter {} / {}", self.epub_chapter + 1, book.chapters.len()))
+                        .into(),
+                );
+                els.push(
+                    widget::button::icon(icon::from_name("go-next-symbolic"))
+                        .on_press(Message::NextPage)
+                        .into(),
+                );
+                els.push(widget::divider::vertical::light().into());
+                if book.chapters.len() > 1 {
+                    let ch_label = if self.show_chapter_select { "Chapters ▾" } else { "Chapters" };
+                    els.push(
+                        widget::button::standard(ch_label)
+                            .on_press(Message::ToggleChapterSelect)
+                            .into(),
+                    );
+                }
+                els.push(
+                    widget::button::icon(icon::from_name("dialog-information-symbolic"))
+                        .on_press(Message::ToggleInfo)
+                        .into(),
+                );
+                els.push(widget::divider::vertical::light().into());
+
+                let theater_label = if self.theater_mode { "Theater: On" } else { "Theater: Off" };
+                els.push(widget::button::standard(theater_label).on_press(Message::ToggleTheater).into());
+                let fs_icon = if self.fullscreen {
+                    icon::from_name("view-restore-symbolic")
+                } else {
+                    icon::from_name("view-fullscreen-symbolic")
+                };
+                els.push(widget::button::icon(fs_icon).on_press(Message::ToggleFullscreen).into());
+                els.push(widget::divider::vertical::light().into());
+                els.push(widget::button::standard("Open").on_press(Message::OpenFile).into());
             }
             AppView::Reader => {
                 if !self.sources.is_empty() {
@@ -605,12 +678,18 @@ impl Application for App {
             event::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                 Some(Message::ModifiersChanged(m))
             }
-            event::Event::Mouse(mouse::Event::WheelScrolled { delta }) => match status {
-                event::Status::Ignored => Some(Message::WheelScrolled(delta)),
+            // Ctrl+scroll and trackpad pinch: while zoom mode is already
+            // active, `widget::image::viewer` owns and captures these
+            // itself. While inactive, the first tick just bootstraps into
+            // zoom mode (see `App::enter_zoom`); the viewer then takes over
+            // for the rest of the gesture. Plain scroll (no Ctrl) is
+            // filtered in `update` so it never bootstraps zoom.
+            event::Event::Mouse(mouse::Event::WheelScrolled { .. }) => match status {
+                event::Status::Ignored => Some(Message::ZoomBootstrapWheel),
                 event::Status::Captured => None,
             },
-            event::Event::Mouse(mouse::Event::WheelZoomed { delta }) => match status {
-                event::Status::Ignored => Some(Message::TrackpadZoom(delta)),
+            event::Event::Mouse(mouse::Event::WheelZoomed { .. }) => match status {
+                event::Status::Ignored => Some(Message::ZoomBootstrap),
                 event::Status::Captured => None,
             },
             event::Event::Touch(t) => Some(Message::Touch(t)),
@@ -637,10 +716,10 @@ impl Application for App {
             }
             Message::OpenFile => {
                 return cosmic::task::future(async move {
-                    let filter = FileFilter::new("Comic Archives")
-                        .glob("*.cbz").glob("*.cbr").glob("*.zip").glob("*.rar");
+                    let filter = FileFilter::new("Comics & Books")
+                        .glob("*.cbz").glob("*.cbr").glob("*.zip").glob("*.rar").glob("*.epub");
                     let dialog = file_chooser::open::Dialog::new()
-                        .title("Open Comic").filter(filter);
+                        .title("Open Comic or Book").filter(filter);
                     match dialog.open_file().await {
                         Ok(r) => Message::PathSelected(r.url().to_owned()),
                         Err(file_chooser::Error::Cancelled) => Message::Cancelled,
@@ -675,7 +754,7 @@ impl Application for App {
                 self.loading = true;
                 self.error = None;
                 self.app_view = AppView::Reader;
-                return open_task(path);
+                return open_any(path);
             }
             Message::OpenFromLibrary { path, page, chapter: _ } => {
                 self.loading = true;
@@ -684,7 +763,7 @@ impl Application for App {
                 // We'll resume at the saved page after Loaded
                 // Store page temporarily in current_page; reset properly in Loaded
                 self.current_page = page;
-                return open_task(path);
+                return open_any(path);
             }
             Message::Loaded(path, sources, chapters) => {
                 let path_str = path.to_string_lossy().to_string();
@@ -702,8 +781,13 @@ impl Application for App {
                 self.zoom = 1.0;
                 self.metadata = None;
                 self.metadata_loading = false;
+                self.comic_info = None;
                 self.comicvine = None;
                 self.comicvine_loading = false;
+                self.comicvine_cover = None;
+                self.epub_book = None;
+                self.epub_chapter = 0;
+                self.epub_cover = None;
                 self.show_chapter_select = false;
                 self.open_path = Some(path.clone());
 
@@ -736,15 +820,84 @@ impl Application for App {
                 let raw_name = self.title.clone();
                 self.metadata_loading = true;
                 let parsed = metadata::parse_filename(&raw_name);
-                self.comicvine_loading = true;
                 self.parsed_filename = Some(parsed.clone());
 
-                let mut tasks =
-                    vec![self.refresh_window(), metadata_task(raw_name), comicvine_task(parsed)];
+                // Embedded ComicInfo.xml is free, offline, and authoritative
+                // when present — prefer it over filename guesswork for the
+                // ComicVine query, the same way Jellyfin does.
+                let comic_info = comic::find_comic_info(&path).map(|xml| comicinfo::parse(&xml));
+                let (cv_series, cv_issue, cv_year) = match &comic_info {
+                    Some(info) if info.series.is_some() => (
+                        info.series.clone().unwrap(),
+                        info.number.clone().or(parsed.issue.map(|n| n.to_string())),
+                        info.year.map(|y| y as u32).or(parsed.year),
+                    ),
+                    _ => (parsed.series.clone(), parsed.issue.map(|n| n.to_string()), parsed.year),
+                };
+                self.comic_info = comic_info;
+
+                self.comicvine_loading = true;
+
+                let mut tasks = vec![
+                    self.refresh_window(),
+                    metadata_task(raw_name),
+                    comicvine_task(cv_series, cv_issue, cv_year),
+                ];
                 if let Some(id) = self.core.main_window_id() {
                     tasks.push(self.set_window_title(self.title.clone(), id));
                 }
                 return Task::batch(tasks);
+            }
+            Message::EpubLoaded(path, result) => {
+                self.loading = false;
+                match result {
+                    Ok(book) => {
+                        let path_str = path.to_string_lossy().to_string();
+                        self.sources.clear();
+                        self.chapters.clear();
+                        self.cache.clear();
+                        self.pending.clear();
+                        self.chapter_covers.clear();
+                        self.covers_pending.clear();
+                        self.zoom_active = false;
+                        self.zoom = 1.0;
+                        self.metadata = None;
+                        self.metadata_loading = false;
+                        self.comic_info = None;
+                        self.comicvine = None;
+                        self.comicvine_loading = false;
+                        self.comicvine_cover = None;
+                        self.show_chapter_select = false;
+                        self.open_path = Some(path.clone());
+                        self.title = book.title.clone();
+                        self.set_header_title(self.title.clone());
+
+                        self.epub_cover = book
+                            .cover
+                            .clone()
+                            .map(widget::image::Handle::from_bytes);
+
+                        let chapter_count = book.chapters.len();
+                        self.epub_chapter = if let Some(db) = &self.db {
+                            library::get_progress(db, &path_str)
+                                .map(|(_, ch)| ch)
+                                .unwrap_or(0)
+                                .min(chapter_count.saturating_sub(1))
+                        } else {
+                            0
+                        };
+                        self.epub_book = Some(book);
+
+                        if let Some(db) = &self.db {
+                            let _ = library::upsert_series(db, &path_str, &self.title, chapter_count);
+                        }
+
+                        if let Some(id) = self.core.main_window_id() {
+                            return self.set_window_title(self.title.clone(), id);
+                        }
+                    }
+                    Err(e) => self.error = Some(e),
+                }
             }
             Message::PageDecoded(index, result) => {
                 self.pending.remove(&index);
@@ -773,7 +926,16 @@ impl Application for App {
             }
             Message::ComicVineLoaded(result) => {
                 self.comicvine_loading = false;
+                let cover_url = result.as_ref().ok().and_then(|m| m.cover_url.clone());
                 self.comicvine = Some(result);
+                if let Some(url) = cover_url {
+                    return comicvine_cover_task(url);
+                }
+            }
+            Message::ComicVineCoverReady(result) => {
+                if let Ok((w, h, rgba)) = result {
+                    self.comicvine_cover = Some(widget::image::Handle::from_rgba(w, h, rgba));
+                }
             }
             Message::ChapterCoverReady { chapter_idx, result } => {
                 self.covers_pending.remove(&chapter_idx);
@@ -803,6 +965,14 @@ impl Application for App {
                 self.library_covers.insert(series_id, handle);
             }
             Message::NextPage => {
+                if let Some(book) = &self.epub_book {
+                    let new = (self.epub_chapter + 1).min(book.chapters.len().saturating_sub(1));
+                    if new != self.epub_chapter {
+                        self.epub_chapter = new;
+                        self.persist_progress();
+                    }
+                    return Task::none();
+                }
                 let step = self.page_step();
                 let new = (self.current_page + step).min(self.sources.len().saturating_sub(1));
                 if new != self.current_page {
@@ -812,6 +982,14 @@ impl Application for App {
                 }
             }
             Message::PrevPage => {
+                if let Some(_book) = &self.epub_book {
+                    let new = self.epub_chapter.saturating_sub(1);
+                    if new != self.epub_chapter {
+                        self.epub_chapter = new;
+                        self.persist_progress();
+                    }
+                    return Task::none();
+                }
                 let step = self.page_step();
                 let new = self.current_page.saturating_sub(step);
                 if new != self.current_page {
@@ -851,7 +1029,11 @@ impl Application for App {
                 }
             }
             Message::SelectChapter(ch_idx) => {
-                if let Some(ch) = self.chapters.get(ch_idx) {
+                if self.epub_book.is_some() {
+                    self.epub_chapter = ch_idx;
+                    self.show_chapter_select = false;
+                    self.persist_progress();
+                } else if let Some(ch) = self.chapters.get(ch_idx) {
                     self.current_page = ch.start;
                     self.show_chapter_select = false;
                     self.persist_progress();
@@ -875,24 +1057,21 @@ impl Application for App {
             Message::ModifiersChanged(m) => {
                 self.modifiers = m;
             }
-            Message::WheelScrolled(delta) => {
+            Message::ZoomBootstrapWheel => {
                 if self.app_view == AppView::Reader
                     && self.modifiers.control()
                     && !self.sources.is_empty()
                 {
-                    let dy = match delta {
-                        mouse::ScrollDelta::Lines { y, .. } => y,
-                        mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
-                    };
-                    if dy != 0.0 {
-                        self.apply_zoom(ZOOM_STEP.powf(dy.signum()));
-                    }
+                    self.enter_zoom();
                 }
             }
-            Message::TrackpadZoom(delta) => {
+            Message::ZoomBootstrap => {
                 if self.app_view == AppView::Reader && !self.sources.is_empty() {
-                    self.apply_zoom(1.0 + delta);
+                    self.enter_zoom();
                 }
+            }
+            Message::ZoomChanged(scale) => {
+                self.zoom = scale.clamp(MIN_ZOOM, MAX_ZOOM);
             }
             Message::Touch(event) => self.handle_touch(event),
             Message::FilesDropped(paths) => {
@@ -900,7 +1079,7 @@ impl Application for App {
                     self.loading = true;
                     self.error = None;
                     self.app_view = AppView::Reader;
-                    return open_task(path);
+                    return open_any(path);
                 }
             }
             Message::DndDataReceived(mime, data) => {
@@ -909,7 +1088,7 @@ impl Application for App {
                         self.loading = true;
                         self.error = None;
                         self.app_view = AppView::Reader;
-                        return open_task(path);
+                        return open_any(path);
                     }
                 }
             }
@@ -937,53 +1116,23 @@ impl App {
         match &key {
             Key::Named(Named::ArrowRight) | Key::Named(Named::PageDown) => {
                 if self.app_view != AppView::Reader { return Task::none(); }
-                if self.zoom_active {
-                    return scroll_mod::scroll_by(self.scroll_id.clone(),
-                        scroll_mod::AbsoluteOffset { x: PAN_STEP, y: 0.0 });
-                }
-                let step = self.page_step();
-                let new = (self.current_page + step).min(self.sources.len().saturating_sub(1));
-                if new != self.current_page {
-                    self.current_page = new;
-                    self.persist_progress();
-                    return self.refresh_window();
-                }
+                return self.update(Message::NextPage);
             }
             Key::Named(Named::ArrowLeft) | Key::Named(Named::PageUp) => {
                 if self.app_view != AppView::Reader { return Task::none(); }
-                if self.zoom_active {
-                    return scroll_mod::scroll_by(self.scroll_id.clone(),
-                        scroll_mod::AbsoluteOffset { x: -PAN_STEP, y: 0.0 });
-                }
-                let step = self.page_step();
-                let new = self.current_page.saturating_sub(step);
-                if new != self.current_page {
-                    self.current_page = new;
-                    self.persist_progress();
-                    return self.refresh_window();
-                }
-            }
-            Key::Named(Named::ArrowDown) if self.zoom_active => {
-                return scroll_mod::scroll_by(self.scroll_id.clone(),
-                    scroll_mod::AbsoluteOffset { x: 0.0, y: PAN_STEP });
-            }
-            Key::Named(Named::ArrowUp) if self.zoom_active => {
-                return scroll_mod::scroll_by(self.scroll_id.clone(),
-                    scroll_mod::AbsoluteOffset { x: 0.0, y: -PAN_STEP });
+                return self.update(Message::PrevPage);
             }
             Key::Named(Named::Escape) => {
                 if self.zoom_active { self.zoom_active = false; self.zoom = 1.0; }
                 else if self.show_chapter_select { self.show_chapter_select = false; }
             }
             Key::Character(c)
-                if self.app_view == AppView::Reader && self.modifiers.control() =>
+                if self.app_view == AppView::Reader
+                    && self.modifiers.control()
+                    && c.as_str() == "0" =>
             {
-                match c.as_str() {
-                    "+" | "=" => self.apply_zoom(ZOOM_STEP),
-                    "-" | "_" => self.apply_zoom(1.0 / ZOOM_STEP),
-                    "0" => { self.zoom_active = false; self.zoom = 1.0; }
-                    _ => {}
-                }
+                self.zoom_active = false;
+                self.zoom = 1.0;
             }
             Key::Character(c) if self.app_view == AppView::Reader => match c.as_str() {
                 "f" | "F" => {
@@ -1148,30 +1297,24 @@ impl App {
 
 impl App {
     fn view_reader(&self) -> Element<'_, Message> {
+        if self.epub_book.is_some() {
+            return self.view_epub_reader();
+        }
+
         // ── Page content ──────────────────────────────────────────────────────
         let viewer: Element<'_, Message> =
             if !self.sources.is_empty() && self.handle(self.current_page).is_some() {
                 match (&self.layout, self.zoom_active) {
                     (_, true) => {
                         let h = self.handle(self.current_page).unwrap();
-                        let page = self.page_data(self.current_page);
-                        let (w, ht) = page
-                            .map(|p| (p.width as f32 * self.zoom, p.height as f32 * self.zoom))
-                            .unwrap_or((0.0, 0.0));
-                        widget::scrollable::scrollable(
-                            widget::image(h.clone())
-                                .content_fit(ContentFit::Fill)
-                                .width(Length::Fixed(w))
-                                .height(Length::Fixed(ht)),
-                        )
-                        .id(self.scroll_id.clone())
-                        .direction(scroll_mod::Direction::Both {
-                            vertical: scroll_mod::Scrollbar::new(),
-                            horizontal: scroll_mod::Scrollbar::new(),
-                        })
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .into()
+                        widget::image::viewer(h.clone())
+                            .content_fit(ContentFit::Contain)
+                            .min_scale(MIN_ZOOM)
+                            .max_scale(MAX_ZOOM)
+                            .on_zoom(Message::ZoomChanged)
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .into()
                     }
                     (Layout::Single, false) => widget::image(
                         self.handle(self.current_page).unwrap().clone(),
@@ -1228,12 +1371,12 @@ impl App {
                     .spacing(12)
                     .align_x(Alignment::Center)
                     .push(icon::from_name("image-x-generic-symbolic").size(64))
-                    .push(widget::text::title3("Open a comic to start reading"))
+                    .push(widget::text::title3("Open a comic or book to start reading"))
                     .push(widget::text(
                         "← → page  ·  C chapters  ·  L layout  ·  M zoom  ·  pinch or Ctrl+scroll to zoom  ·  T theater  ·  F fullscreen  ·  I info  ·  P copy",
                     ).size(12))
                     .push(widget::text("You can also drag and drop a file or folder here.").size(12))
-                    .push(widget::button::suggested("Open Comic").on_press(Message::OpenFile))
+                    .push(widget::button::suggested("Open Comic or Book").on_press(Message::OpenFile))
                     .into()
             };
 
@@ -1286,6 +1429,133 @@ impl App {
             col = col.push(error_banner(err));
         }
         col.push(main_row).into()
+    }
+
+    fn view_epub_reader(&self) -> Element<'_, Message> {
+        let book = self.epub_book.as_ref().unwrap();
+
+        let content: Element<'_, Message> = if let Some(chapter) = book.chapters.get(self.epub_chapter)
+        {
+            let mut page = widget::Column::new().spacing(14).max_width(720.0).padding(24);
+            for block in &chapter.blocks {
+                page = page.push(render_epub_block(block));
+            }
+            widget::scrollable::scrollable(
+                widget::container(page).width(Length::Fill).center_x(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        } else {
+            widget::text("This book has no chapters.").into()
+        };
+
+        let content_bg: Element<'_, Message> = if self.theater_mode {
+            widget::container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_: &cosmic::Theme| widget::container::Style {
+                    background: Some(Background::Color(Color::BLACK)),
+                    ..Default::default()
+                })
+                .into()
+        } else {
+            widget::container(content).width(Length::Fill).height(Length::Fill).into()
+        };
+
+        let main_row: Element<'_, Message> = if self.show_chapter_select {
+            widget::Row::new()
+                .push(widget::container(content_bg).width(Length::Fill).height(Length::Fill))
+                .push(self.build_epub_chapter_select())
+                .into()
+        } else if self.show_info {
+            widget::Row::new()
+                .push(widget::container(content_bg).width(Length::Fill).height(Length::Fill))
+                .push(self.build_epub_info_panel())
+                .into()
+        } else {
+            content_bg
+        };
+
+        let mut col = widget::Column::new().spacing(8);
+        if let Some(err) = self.error.as_deref() {
+            col = col.push(error_banner(err));
+        }
+        col.push(main_row).into()
+    }
+
+    fn build_epub_chapter_select(&self) -> Element<'_, Message> {
+        let book = self.epub_book.as_ref().unwrap();
+        let mut col = widget::Column::new().spacing(0);
+
+        col = col.push(
+            widget::Row::new()
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .padding(12)
+                .push(widget::text::title4("Chapters").width(Length::Fill))
+                .push(
+                    widget::button::icon(icon::from_name("window-close-symbolic"))
+                        .on_press(Message::ToggleChapterSelect),
+                ),
+        );
+        col = col.push(widget::divider::horizontal::light());
+
+        let mut list = widget::Column::new().spacing(2).padding(8);
+        for (idx, chapter) in book.chapters.iter().enumerate() {
+            let is_current = idx == self.epub_chapter;
+            let label = widget::text(chapter.title.clone())
+                .size(if is_current { 14 } else { 13 });
+
+            let row_el: Element<'_, Message> = if is_current {
+                widget::container(label)
+                    .padding(6)
+                    .width(Length::Fill)
+                    .style(|_: &cosmic::Theme| widget::container::Style {
+                        background: Some(Background::Color(Color::from_rgba(0.3, 0.5, 1.0, 0.15))),
+                        ..Default::default()
+                    })
+                    .into()
+            } else {
+                mouse_area(widget::container(label).padding(6).width(Length::Fill))
+                    .on_press(Message::SelectChapter(idx))
+                    .into()
+            };
+            list = list.push(row_el);
+        }
+
+        col = col.push(widget::scrollable::scrollable(list).height(Length::Fill));
+
+        widget::container(col).width(Length::Fixed(300.0)).height(Length::Fill).into()
+    }
+
+    fn build_epub_info_panel(&self) -> Element<'_, Message> {
+        let book = self.epub_book.as_ref().unwrap();
+        let mut col = widget::Column::new().spacing(8).padding(12);
+
+        if let Some(cover) = &self.epub_cover {
+            col = col.push(
+                widget::image(cover.clone())
+                    .width(Length::Fixed(160.0))
+                    .content_fit(ContentFit::Contain),
+            );
+        }
+
+        col = col.push(widget::text::title4(book.title.clone()));
+        if let Some(author) = &book.author {
+            col = col.push(widget::text(author.clone()).size(13));
+        }
+        col = col.push(widget::divider::horizontal::light());
+
+        if let Some(chapter) = book.chapters.get(self.epub_chapter) {
+            col = col.push(
+                widget::text(format!("Chapter {} of {}", self.epub_chapter + 1, book.chapters.len()))
+                    .size(13),
+            );
+            col = col.push(widget::text(chapter.title.clone()).size(13));
+        }
+
+        widget::container(col).width(Length::Fixed(280.0)).height(Length::Fill).into()
     }
 
     fn build_chapter_select(&self) -> Element<'_, Message> {
@@ -1392,6 +1662,35 @@ impl App {
             col = col.push(widget::divider::horizontal::light());
         }
 
+        // ── Embedded ComicInfo.xml, when present (free, offline, authoritative) ─
+        if let Some(info) = &self.comic_info {
+            if !info.is_empty() {
+                col = col.push(widget::text::title4("ComicInfo.xml"));
+                if let Some(s) = &info.series {
+                    col = col.push(widget::text(format!("Series: {s}")).size(12));
+                }
+                if let Some(n) = &info.number {
+                    col = col.push(widget::text(format!("Number: {n}")).size(12));
+                }
+                if let Some(v) = &info.volume {
+                    col = col.push(widget::text(format!("Volume: {v}")).size(12));
+                }
+                if let Some(y) = info.year {
+                    col = col.push(widget::text(format!("Year: {y}")).size(12));
+                }
+                if let Some(p) = &info.publisher {
+                    col = col.push(widget::text(format!("Publisher: {p}")).size(12));
+                }
+                if let Some(w) = &info.writer {
+                    col = col.push(widget::text(format!("Writer: {w}")).size(12));
+                }
+                if let Some(g) = &info.genre {
+                    col = col.push(widget::text(format!("Genre: {g}")).size(12));
+                }
+                col = col.push(widget::divider::horizontal::light());
+            }
+        }
+
         // ── Debug: what we parsed out of the filename ─────────────────────────
         col = col.push(widget::text::title4("Debug: Metadata Matching"));
         if let Some(p) = &self.parsed_filename {
@@ -1445,6 +1744,13 @@ impl App {
         } else {
             match &self.comicvine {
                 Some(Ok(m)) => {
+                    if let Some(cover) = &self.comicvine_cover {
+                        col = col.push(
+                            widget::image(cover.clone())
+                                .width(Length::Fixed(160.0))
+                                .content_fit(ContentFit::Contain),
+                        );
+                    }
                     col = col.push(widget::text(m.name.clone()).size(13));
                     if let Some(v) = &m.volume {
                         col = col.push(widget::text(format!("Volume: {v}")).size(12));
@@ -1501,6 +1807,32 @@ fn first_path_from_uri_list(data: &[u8]) -> Option<PathBuf> {
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .and_then(|line| Url::parse(line).ok())
         .and_then(|url| url.to_file_path().ok())
+}
+
+/// Renders one parsed EPUB block with heading-appropriate sizing.
+fn render_epub_block(block: &epub::Block) -> Element<'_, Message> {
+    match block {
+        epub::Block::Heading(level, text) => {
+            let size: u16 = match level {
+                1 => 28,
+                2 => 24,
+                3 => 20,
+                4 => 18,
+                5 => 16,
+                _ => 15,
+            };
+            widget::text(text.clone()).size(size).into()
+        }
+        epub::Block::Paragraph(text) => widget::text(text.clone()).size(16).into(),
+        epub::Block::Quote(text) => widget::container(widget::text(text.clone()).size(15))
+            .padding([4, 16])
+            .into(),
+        epub::Block::ListItem(text) => widget::text(format!("•  {text}")).size(16).into(),
+        epub::Block::Image(bytes) => widget::image(widget::image::Handle::from_bytes(bytes.clone()))
+            .width(Length::Fill)
+            .content_fit(ContentFit::Contain)
+            .into(),
+    }
 }
 
 fn error_banner(msg: &str) -> Element<'_, Message> {
