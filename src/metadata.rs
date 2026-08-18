@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct SeriesMetadata {
@@ -146,7 +147,70 @@ pub async fn fetch_series_metadata(search_title: &str) -> Result<SeriesMetadata,
     })
 }
 
-fn strip_html(s: &str) -> String {
+/// A best-effort breakdown of a comic filename into series / issue / year,
+/// e.g. "Civil War 001 (2006) (Digital) (Zone-Empire).cbr" ->
+/// series "Civil War", issue 1, year 2006.
+#[derive(Clone, Debug)]
+pub struct ParsedFilename {
+    pub series: String,
+    pub issue: Option<u32>,
+    pub year: Option<u32>,
+}
+
+pub fn parse_filename(raw: &str) -> ParsedFilename {
+    let base = Path::new(raw)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| raw.to_string());
+
+    // Strip bracketed/parenthesized groups, e.g. "(2006)", "(Digital)",
+    // "(Zone-Empire)" — remembering the first that looks like a year.
+    let mut year = None;
+    let mut without_groups = String::with_capacity(base.len());
+    let mut depth = 0u32;
+    let mut group = String::new();
+    for c in base.chars() {
+        match c {
+            '(' | '[' => {
+                depth += 1;
+                group.clear();
+            }
+            ')' | ']' if depth > 0 => {
+                depth -= 1;
+                if year.is_none() {
+                    let g = group.trim();
+                    if g.len() == 4 && g.chars().all(|c| c.is_ascii_digit()) {
+                        if let Ok(y) = g.parse::<u32>() {
+                            if (1900..=2100).contains(&y) {
+                                year = Some(y);
+                            }
+                        }
+                    }
+                }
+            }
+            _ if depth > 0 => group.push(c),
+            _ => without_groups.push(c),
+        }
+    }
+
+    // The trailing numeric token (if any) is the issue number.
+    let mut tokens: Vec<&str> = without_groups.split_whitespace().collect();
+    let mut issue = None;
+    if let Some(last) = tokens.last() {
+        let all_digits = !last.is_empty() && last.chars().all(|c| c.is_ascii_digit());
+        if all_digits && last.len() <= 4 {
+            if let Ok(n) = last.parse::<u32>() {
+                issue = Some(n);
+                tokens.pop();
+            }
+        }
+    }
+
+    let series = tokens.join(" ").trim().to_string();
+    ParsedFilename { series: if series.is_empty() { base } else { series }, issue, year }
+}
+
+pub(crate) fn strip_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
     for c in s.chars() {

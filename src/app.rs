@@ -8,7 +8,7 @@ use cosmic::dialog::file_chooser::{self, FileFilter};
 use cosmic::iced::{
     event,
     keyboard::{self, key::Named, Key},
-    window, Alignment, Background, Color, ContentFit, Length, Subscription,
+    mouse, touch, window, Alignment, Background, Color, ContentFit, Length, Point, Subscription,
 };
 use cosmic::iced::widget::scrollable as scroll_mod;
 use cosmic::iced::widget::mouse_area;
@@ -17,8 +17,13 @@ use cosmic::{executor, Application, ApplicationExt, Element};
 use url::Url;
 
 use crate::comic::{self, ChapterInfo, PageSource};
+use crate::comicvine::{self, ComicVineMatch};
 use crate::library::{self, SeriesEntry};
-use crate::metadata::{self, SeriesMetadata};
+use crate::metadata::{self, ParsedFilename, SeriesMetadata};
+
+const MIN_ZOOM: f32 = 0.25;
+const MAX_ZOOM: f32 = 6.0;
+const ZOOM_STEP: f32 = 1.2;
 
 pub const APP_ID: &str = "com.tsingel.CosmicComic";
 
@@ -69,13 +74,20 @@ pub enum Message {
     CopiedPage(Result<(), String>),
     // Metadata
     MetadataLoaded(Result<SeriesMetadata, String>),
+    ComicVineLoaded(Result<ComicVineMatch, String>),
     // Chapter covers
     ChapterCoverReady { chapter_idx: usize, result: Result<(u32, u32, Vec<u8>), String> },
     // Library
     LibrarySearchChanged(String),
     LibraryCoverReady { series_id: i64, path: PathBuf },
-    // Keys
+    // Keys / pointer / touch
     Key(Key),
+    ModifiersChanged(keyboard::Modifiers),
+    WheelScrolled(mouse::ScrollDelta),
+    Touch(touch::Event),
+    // Drag and drop
+    FilesDropped(Vec<PathBuf>),
+    DndDataReceived(String, Vec<u8>),
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -98,11 +110,19 @@ pub struct App {
     theater_mode: bool,
     layout: Layout,
     zoom_active: bool,
+    zoom: f32,
     scroll_id: widget::Id,
     show_info: bool,
     show_chapter_select: bool,
     metadata: Option<SeriesMetadata>,
     metadata_loading: bool,
+    parsed_filename: Option<ParsedFilename>,
+    comicvine: Option<Result<ComicVineMatch, String>>,
+    comicvine_loading: bool,
+    // pointer / touch state
+    modifiers: keyboard::Modifiers,
+    touches: HashMap<touch::Finger, Point>,
+    pinch_last_dist: Option<f32>,
     // chapter covers (decoded for the currently open series)
     chapter_covers: HashMap<usize, widget::image::Handle>,
     covers_pending: HashSet<usize>,
@@ -163,6 +183,16 @@ fn metadata_task(raw_name: String) -> Task<Message> {
     cosmic::task::future(async move {
         let title = metadata::extract_title(&raw_name);
         Message::MetadataLoaded(metadata::fetch_series_metadata(&title).await)
+    })
+}
+
+fn comicvine_task(parsed: ParsedFilename) -> Task<Message> {
+    cosmic::task::future(async move {
+        let query = match parsed.issue {
+            Some(n) => format!("{} #{n}", parsed.series),
+            None => parsed.series.clone(),
+        };
+        Message::ComicVineLoaded(comicvine::search_issue(&query).await)
     })
 }
 
@@ -241,6 +271,46 @@ impl App {
 
     fn page_step(&self) -> usize {
         if self.layout == Layout::Dual { 2 } else { 1 }
+    }
+
+    /// Multiplies the current zoom level by `factor`, clamped, and switches
+    /// into zoom/pan mode if not already active.
+    fn apply_zoom(&mut self, factor: f32) {
+        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom_active = true;
+    }
+
+    /// Tracks active touch points and turns a two-finger pinch into a zoom
+    /// change (touchscreen pinch-to-zoom).
+    fn handle_touch(&mut self, event: touch::Event) {
+        match event {
+            touch::Event::FingerPressed { id, position } => {
+                self.touches.insert(id, position);
+                if self.touches.len() != 2 {
+                    self.pinch_last_dist = None;
+                }
+            }
+            touch::Event::FingerMoved { id, position } => {
+                self.touches.insert(id, position);
+                if self.app_view == AppView::Reader && self.touches.len() == 2 {
+                    let mut pts = self.touches.values().copied();
+                    let (a, b) = (pts.next().unwrap(), pts.next().unwrap());
+                    let dist = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+                    if let Some(prev) = self.pinch_last_dist {
+                        if prev > 1.0 {
+                            self.apply_zoom(dist / prev);
+                        }
+                    }
+                    self.pinch_last_dist = Some(dist);
+                }
+            }
+            touch::Event::FingerLifted { id, .. } | touch::Event::FingerLost { id, .. } => {
+                self.touches.remove(&id);
+                if self.touches.len() < 2 {
+                    self.pinch_last_dist = None;
+                }
+            }
+        }
     }
 
     fn handle(&self, idx: usize) -> Option<&widget::image::Handle> {
@@ -355,11 +425,18 @@ impl Application for App {
             theater_mode: false,
             layout: Layout::Single,
             zoom_active: false,
+            zoom: 1.0,
             scroll_id: widget::Id::new("viewer"),
             show_info: false,
             show_chapter_select: false,
             metadata: None,
             metadata_loading: false,
+            parsed_filename: None,
+            comicvine: None,
+            comicvine_loading: false,
+            modifiers: keyboard::Modifiers::default(),
+            touches: HashMap::new(),
+            pinch_last_dist: None,
             chapter_covers: HashMap::new(),
             covers_pending: HashSet::new(),
             db,
@@ -462,7 +539,11 @@ impl Application for App {
                             .into(),
                     );
 
-                    let zoom_label = if self.zoom_active { "Zoom: On" } else { "Zoom: Off" };
+                    let zoom_label = if self.zoom_active {
+                        format!("Zoom {:.0}%", self.zoom * 100.0)
+                    } else {
+                        "Zoom: Off".to_string()
+                    };
                     els.push(
                         widget::button::standard(zoom_label)
                             .on_press(Message::ToggleZoom)
@@ -520,6 +601,17 @@ impl Application for App {
                 event::Status::Ignored => Some(Message::Key(key)),
                 event::Status::Captured => None,
             },
+            event::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
+                Some(Message::ModifiersChanged(m))
+            }
+            event::Event::Mouse(mouse::Event::WheelScrolled { delta }) => match status {
+                event::Status::Ignored => Some(Message::WheelScrolled(delta)),
+                event::Status::Captured => None,
+            },
+            event::Event::Touch(t) => Some(Message::Touch(t)),
+            event::Event::Window(window::Event::FileDropped(paths)) => {
+                Some(Message::FilesDropped(paths))
+            }
             _ => None,
         })
     }
@@ -602,8 +694,11 @@ impl Application for App {
                 self.chapter_covers.clear();
                 self.covers_pending.clear();
                 self.zoom_active = false;
+                self.zoom = 1.0;
                 self.metadata = None;
                 self.metadata_loading = false;
+                self.comicvine = None;
+                self.comicvine_loading = false;
                 self.show_chapter_select = false;
                 self.open_path = Some(path.clone());
 
@@ -635,8 +730,12 @@ impl Application for App {
 
                 let raw_name = self.title.clone();
                 self.metadata_loading = true;
+                let parsed = metadata::parse_filename(&raw_name);
+                self.comicvine_loading = true;
+                self.parsed_filename = Some(parsed.clone());
 
-                let mut tasks = vec![self.refresh_window(), metadata_task(raw_name)];
+                let mut tasks =
+                    vec![self.refresh_window(), metadata_task(raw_name), comicvine_task(parsed)];
                 if let Some(id) = self.core.main_window_id() {
                     tasks.push(self.set_window_title(self.title.clone(), id));
                 }
@@ -666,6 +765,10 @@ impl Application for App {
                     }
                     self.metadata = Some(meta);
                 }
+            }
+            Message::ComicVineLoaded(result) => {
+                self.comicvine_loading = false;
+                self.comicvine = Some(result);
             }
             Message::ChapterCoverReady { chapter_idx, result } => {
                 self.covers_pending.remove(&chapter_idx);
@@ -727,7 +830,10 @@ impl Application for App {
                 }
                 return self.refresh_window();
             }
-            Message::ToggleZoom => { self.zoom_active = !self.zoom_active; }
+            Message::ToggleZoom => {
+                self.zoom_active = !self.zoom_active;
+                self.zoom = 1.0;
+            }
             Message::ToggleInfo => {
                 self.show_info = !self.show_info;
                 if self.show_info { self.show_chapter_select = false; }
@@ -761,15 +867,56 @@ impl Application for App {
             Message::Key(key) => {
                 return self.handle_key(key);
             }
+            Message::ModifiersChanged(m) => {
+                self.modifiers = m;
+            }
+            Message::WheelScrolled(delta) => {
+                if self.app_view == AppView::Reader
+                    && self.modifiers.control()
+                    && !self.sources.is_empty()
+                {
+                    let dy = match delta {
+                        mouse::ScrollDelta::Lines { y, .. } => y,
+                        mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
+                    };
+                    if dy != 0.0 {
+                        self.apply_zoom(ZOOM_STEP.powf(dy.signum()));
+                    }
+                }
+            }
+            Message::Touch(event) => self.handle_touch(event),
+            Message::FilesDropped(paths) => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.loading = true;
+                    self.error = None;
+                    self.app_view = AppView::Reader;
+                    return open_task(path);
+                }
+            }
+            Message::DndDataReceived(mime, data) => {
+                if mime.contains("uri-list") {
+                    if let Some(path) = first_path_from_uri_list(&data) {
+                        self.loading = true;
+                        self.error = None;
+                        self.app_view = AppView::Reader;
+                        return open_task(path);
+                    }
+                }
+            }
         }
         Task::none()
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        match self.app_view {
+        let content = match self.app_view {
             AppView::Library => self.view_library(),
             AppView::Reader => self.view_reader(),
-        }
+        };
+
+        widget::dnd_destination(content, vec![Cow::Borrowed("text/uri-list")])
+            .on_finish(|mime, data, _action, _x, _y| Message::DndDataReceived(mime, data))
+            .on_data_received(Message::DndDataReceived)
+            .into()
     }
 }
 
@@ -815,8 +962,18 @@ impl App {
                     scroll_mod::AbsoluteOffset { x: 0.0, y: -PAN_STEP });
             }
             Key::Named(Named::Escape) => {
-                if self.zoom_active { self.zoom_active = false; }
+                if self.zoom_active { self.zoom_active = false; self.zoom = 1.0; }
                 else if self.show_chapter_select { self.show_chapter_select = false; }
+            }
+            Key::Character(c)
+                if self.app_view == AppView::Reader && self.modifiers.control() =>
+            {
+                match c.as_str() {
+                    "+" | "=" => self.apply_zoom(ZOOM_STEP),
+                    "-" | "_" => self.apply_zoom(1.0 / ZOOM_STEP),
+                    "0" => { self.zoom_active = false; self.zoom = 1.0; }
+                    _ => {}
+                }
             }
             Key::Character(c) if self.app_view == AppView::Reader => match c.as_str() {
                 "f" | "F" => {
@@ -834,7 +991,7 @@ impl App {
                     }
                     return self.refresh_window();
                 }
-                "m" | "M" => self.zoom_active = !self.zoom_active,
+                "m" | "M" => { self.zoom_active = !self.zoom_active; self.zoom = 1.0; }
                 "i" | "I" => {
                     self.show_info = !self.show_info;
                     if self.show_info { self.show_chapter_select = false; }
@@ -896,7 +1053,7 @@ impl App {
                     .align_x(Alignment::Center)
                     .push(icon::from_name("library-symbolic").size(64))
                     .push(widget::text::title3("Your library is empty"))
-                    .push(widget::text("Open a comic or series to add it here.").size(14))
+                    .push(widget::text("Open a comic or series to add it here, or drag and drop one in.").size(14))
                     .push(
                         widget::Row::new().spacing(8)
                             .push(widget::button::standard("Open File").on_press(Message::OpenFile))
@@ -943,8 +1100,8 @@ impl App {
             .into()
         };
 
-        let title_text = if entry.title.len() > 22 {
-            format!("{}…", &entry.title[..20])
+        let title_text = if entry.title.chars().count() > 22 {
+            format!("{}…", entry.title.chars().take(20).collect::<String>())
         } else {
             entry.title.clone()
         };
@@ -987,11 +1144,15 @@ impl App {
                 match (&self.layout, self.zoom_active) {
                     (_, true) => {
                         let h = self.handle(self.current_page).unwrap();
+                        let page = self.page_data(self.current_page);
+                        let (w, ht) = page
+                            .map(|p| (p.width as f32 * self.zoom, p.height as f32 * self.zoom))
+                            .unwrap_or((0.0, 0.0));
                         widget::scrollable::scrollable(
                             widget::image(h.clone())
-                                .content_fit(ContentFit::None)
-                                .width(Length::Shrink)
-                                .height(Length::Shrink),
+                                .content_fit(ContentFit::Fill)
+                                .width(Length::Fixed(w))
+                                .height(Length::Fixed(ht)),
                         )
                         .id(self.scroll_id.clone())
                         .direction(scroll_mod::Direction::Both {
@@ -1059,8 +1220,9 @@ impl App {
                     .push(icon::from_name("image-x-generic-symbolic").size(64))
                     .push(widget::text::title3("Open a comic to start reading"))
                     .push(widget::text(
-                        "← → page  ·  C chapters  ·  L layout  ·  M zoom  ·  T theater  ·  F fullscreen  ·  I info  ·  P copy",
+                        "← → page  ·  C chapters  ·  L layout  ·  M zoom  ·  Ctrl+scroll / pinch to zoom  ·  T theater  ·  F fullscreen  ·  I info  ·  P copy",
                     ).size(12))
+                    .push(widget::text("You can also drag and drop a file or folder here.").size(12))
                     .push(widget::button::suggested("Open Comic").on_press(Message::OpenFile))
                     .into()
             };
@@ -1162,8 +1324,8 @@ impl App {
             };
 
             let label_size: u16 = if is_current { 14 } else { 13 };
-            let ch_name = if ch.name.len() > 30 {
-                format!("{}…", &ch.name[..28])
+            let ch_name = if ch.name.chars().count() > 30 {
+                format!("{}…", ch.name.chars().take(28).collect::<String>())
             } else {
                 ch.name.clone()
             };
@@ -1220,23 +1382,87 @@ impl App {
             col = col.push(widget::divider::horizontal::light());
         }
 
+        // ── Debug: what we parsed out of the filename ─────────────────────────
+        col = col.push(widget::text::title4("Debug: Metadata Matching"));
+        if let Some(p) = &self.parsed_filename {
+            col = col.push(widget::text(format!("Parsed series: {}", p.series)).size(12));
+            col = col.push(
+                widget::text(format!(
+                    "Parsed issue: {}",
+                    p.issue.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
+                ))
+                .size(12),
+            );
+            col = col.push(
+                widget::text(format!(
+                    "Parsed year: {}",
+                    p.year.map(|n| n.to_string()).unwrap_or_else(|| "—".into())
+                ))
+                .size(12),
+            );
+        }
+        col = col.push(widget::divider::horizontal::light());
+
+        // AniList (manga/anime only — won't match Western comics)
+        col = col.push(widget::text::title4("AniList (manga/anime)"));
         if self.metadata_loading {
-            col = col.push(widget::text("Fetching metadata…").size(13))
+            col = col.push(widget::text("Fetching…").size(12))
                 .push(widget::indeterminate_circular());
         } else if let Some(meta) = &self.metadata {
-            col = col.push(widget::text::title4(meta.title.clone()));
+            col = col.push(widget::text(meta.title.clone()).size(13));
             if !meta.status.is_empty() {
-                col = col.push(widget::text(format!("Status: {}", meta.status)).size(13));
+                col = col.push(widget::text(format!("Status: {}", meta.status)).size(12));
             }
             if let Some(n) = meta.chapter_count {
-                col = col.push(widget::text(format!("Chapters: {n}")).size(13));
+                col = col.push(widget::text(format!("Chapters: {n}")).size(12));
             }
             if let Some(s) = meta.score {
-                col = col.push(widget::text(format!("Score: {s}/100")).size(13));
+                col = col.push(widget::text(format!("Score: {s}/100")).size(12));
             }
             if !meta.genres.is_empty() {
-                col = col.push(widget::text(format!("Genres: {}", meta.genres.join(", "))).size(13));
+                col = col.push(widget::text(format!("Genres: {}", meta.genres.join(", "))).size(12));
             }
+        } else {
+            col = col.push(widget::text("No match.").size(12));
+        }
+        col = col.push(widget::divider::horizontal::light());
+
+        // ComicVine (Western comics — Marvel/DC/etc.)
+        col = col.push(widget::text::title4("ComicVine (Western comics)"));
+        if self.comicvine_loading {
+            col = col.push(widget::text("Fetching…").size(12))
+                .push(widget::indeterminate_circular());
+        } else {
+            match &self.comicvine {
+                Some(Ok(m)) => {
+                    col = col.push(widget::text(m.name.clone()).size(13));
+                    if let Some(v) = &m.volume {
+                        col = col.push(widget::text(format!("Volume: {v}")).size(12));
+                    }
+                    if let Some(n) = &m.issue_number {
+                        col = col.push(widget::text(format!("Issue #: {n}")).size(12));
+                    }
+                    if let Some(d) = &m.cover_date {
+                        col = col.push(widget::text(format!("Cover date: {d}")).size(12));
+                    }
+                    if let Some(d) = &m.description {
+                        let snippet: String = if d.chars().count() > 200 {
+                            format!("{}…", d.chars().take(200).collect::<String>())
+                        } else {
+                            d.clone()
+                        };
+                        col = col.push(widget::text(snippet).size(12));
+                    }
+                    if let Some(u) = &m.site_url {
+                        col = col.push(widget::text(u.clone()).size(11));
+                    }
+                }
+                Some(Err(e)) => col = col.push(widget::text(e.clone()).size(12)),
+                None => col = col.push(widget::text("No match.").size(12)),
+            }
+        }
+
+        if let Some(meta) = &self.metadata {
             if !meta.description.is_empty() {
                 col = col.push(widget::divider::horizontal::light());
                 col = col.push(widget::text::title4("Synopsis"));
@@ -1245,18 +1471,27 @@ impl App {
                         .height(Length::Fill),
                 );
             }
-        } else {
-            col = col.push(widget::text("No metadata found.").size(13));
         }
 
         widget::container(col)
-            .width(Length::Fixed(280.0))
+            .width(Length::Fixed(300.0))
             .height(Length::Fill)
             .into()
     }
 }
 
 // ── Standalone helpers ────────────────────────────────────────────────────────
+
+/// Parses a `text/uri-list` payload (as delivered by drag-and-drop) and
+/// returns the first `file://` entry as a local path.
+fn first_path_from_uri_list(data: &[u8]) -> Option<PathBuf> {
+    let text = String::from_utf8_lossy(data);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .and_then(|line| Url::parse(line).ok())
+        .and_then(|url| url.to_file_path().ok())
+}
 
 fn error_banner(msg: &str) -> Element<'_, Message> {
     widget::container(
