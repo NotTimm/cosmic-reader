@@ -25,14 +25,22 @@ reqwest = { version = "0.12", features = ["json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 quick-xml = "0.37"
 
-# Fork of pop-os/libcosmic that forwards winit's trackpad pinch gesture
-# (WindowEvent::PinchGesture) through iced as mouse::Event::WheelZoomed,
-# which upstream iced drops entirely. See NotTimm/libcosmic's single commit
-# on top of pop-os/libcosmic for the diff. Re-sync by rebasing that commit
-# onto a newer pop-os/libcosmic and updating `rev` below.
+# Fork of pop-os/libcosmic with three patches on top of pop-os/libcosmic:
+# 1. Forwards winit's trackpad pinch gesture (WindowEvent::PinchGesture)
+#    through iced as mouse::Event::WheelZoomed, which upstream iced drops
+#    entirely.
+# 2. In image::Viewer, lets a physical mouse wheel zoom without Ctrl (it
+#    reports discrete ScrollDelta::Lines, unambiguous with scrolling)
+#    while keeping trackpad two-finger scroll (ScrollDelta::Pixels)
+#    Ctrl-gated for zoom, since that's ambiguous with panning intent.
+# 3. In image::Viewer, trackpad two-finger scroll without Ctrl pans a
+#    zoomed-in image instead of doing nothing — free diagonal movement,
+#    since x/y move independently.
+# Re-sync by rebasing NotTimm/libcosmic's commits onto a newer
+# pop-os/libcosmic and updating `rev` below.
 [dependencies.libcosmic]
 git = "https://github.com/NotTimm/libcosmic.git"
-rev = "b5ac934b7005e9353a08e2e7fb4e303ee76c8cc4"
+rev = "afd5f9e008681f1961d093d87b8735cd17405f5a"
 default-features = false
 features = ["dbus-config", "wgpu", "wayland", "winit", "tokio", "xdg-portal", "multi-window"]
 

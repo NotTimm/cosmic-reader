@@ -997,11 +997,21 @@ impl Application for App {
                 self.current_page = saved_page;
                 self.nav_dir = 1;
 
-                // Update library DB
+                // Update library DB. This runs for any opened file, not
+                // just ones under a configured library folder, so a
+                // one-off "Open File" still gets a shelf cover.
+                let mut cover_task_for_open: Option<Task<Message>> = None;
                 if let Some(db) = &self.db {
                     let title = metadata::extract_title(&self.title);
                     let _ = library::upsert_series(db, &path_str, &title, total, path.is_dir());
                     let _ = library::touch_opened(db, &path_str);
+
+                    let cover_path = library::chapter_cover_path(&path_str, 0);
+                    if !cover_path.exists() {
+                        if let Some(source) = self.sources.first().cloned() {
+                            cover_task_for_open = Some(comic_library_cover_task(source, path.clone()));
+                        }
+                    }
                 }
 
                 let raw_name = self.title.clone();
@@ -1024,6 +1034,9 @@ impl Application for App {
                 self.comic_info = comic_info;
 
                 let mut tasks = vec![self.refresh_window()];
+                if let Some(t) = cover_task_for_open {
+                    tasks.push(t);
+                }
                 if self.settings.fetch_metadata {
                     self.comicvine_loading = true;
                     tasks.push(metadata_task(raw_name));
@@ -1074,16 +1087,30 @@ impl Application for App {
                         } else {
                             0
                         };
+                        let cover_bytes = book.cover.clone();
                         self.epub_book = Some(book);
 
+                        // As with comics: any opened EPUB gets a shelf
+                        // cover, not just ones under a library folder.
+                        let mut cover_task_for_open = None;
                         if let Some(db) = &self.db {
                             let _ = library::upsert_series(db, &path_str, &self.title, chapter_count, false);
                             let _ = library::touch_opened(db, &path_str);
+
+                            let cover_path = library::chapter_cover_path(&path_str, 0);
+                            if !cover_path.exists() {
+                                if let Some(bytes) = cover_bytes {
+                                    cover_task_for_open = Some(epub_library_cover_task(bytes, path.clone()));
+                                }
+                            }
                         }
 
-                        if let Some(id) = self.core.main_window_id() {
-                            return self.set_window_title(self.title.clone(), id);
-                        }
+                        let title_task = self.core.main_window_id()
+                            .map(|id| self.set_window_title(self.title.clone(), id));
+
+                        return Task::batch(
+                            cover_task_for_open.into_iter().chain(title_task),
+                        );
                     }
                     Err(e) => self.error = Some(e),
                 }

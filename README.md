@@ -14,8 +14,11 @@ archives (`.cbz`/`.cbr`), manga/comic series folders, and `.epub` books.
 - Basic `.epub` support: chapter navigation, heading sizes, cover
 - Reading progress and metadata saved to a local SQLite database
 - Single/dual page layout, theater mode, fullscreen
-- Zoom & pan: `Ctrl`+scroll wheel, real trackpad/touchscreen pinch (see the
-  libcosmic fork note below), or `M`/`Ctrl 0`
+- Zoom & pan: mouse wheel zooms directly (no modifier needed), trackpad/
+  touchscreen pinch zooms (see the libcosmic fork note below), `Ctrl`+
+  trackpad scroll also zooms, plain trackpad two-finger scroll pans a
+  zoomed-in image (free diagonal movement), click-drag pans too, and
+  `M`/`Ctrl 0` toggle/reset zoom
 - Drag and drop a file, folder, or book onto the window to open it
 - Metadata debug panel (the `i` button): embedded `ComicInfo.xml` when
   present, plus what it matched via AniList (manga/anime) and ComicVine
