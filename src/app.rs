@@ -67,6 +67,12 @@ pub enum Message {
     PageDecoded(usize, Result<Arc<comic::Page>, String>),
     LoadFailed(String),
     Cancelled,
+    /// No-op message that just forces an extra render pass. Newly-decoded
+    /// page textures sometimes don't actually appear on the frame they're
+    /// inserted into (looks like a blank page until the next redraw, e.g.
+    /// from pressing an arrow key) — this nudges iced to redraw once more
+    /// shortly after a page lands in the cache.
+    Redraw,
     // Reading
     NextPage,
     PrevPage,
@@ -94,6 +100,8 @@ pub enum Message {
     AddLibraryFolder,
     LibraryFolderSelected(Url),
     RemoveLibraryFolder(PathBuf),
+    LibraryPathInputChanged(String),
+    LibraryPathInputSubmitted,
     // Settings
     ToggleSettings,
     CloseContext,
@@ -112,6 +120,9 @@ pub enum Message {
     // Drag and drop
     FilesDropped(Vec<PathBuf>),
     DndDataReceived(String, Vec<u8>),
+    // Fit page
+    FitPage,
+    FitPageSize(cosmic::iced::Size),
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -162,6 +173,7 @@ pub struct App {
     library_search: String,
     library_covers: HashMap<i64, widget::image::Handle>,
     library_dirs: Vec<PathBuf>,
+    library_path_input: String,
     // settings
     settings: Settings,
     context_page: ContextPage,
@@ -446,6 +458,20 @@ fn load_cover_from_disk(series_id: i64, path: PathBuf) -> Task<Message> {
     })
 }
 
+/// Expand a leading `~` or `~/...` to the user's home directory, so the
+/// typed library-path field accepts what a shell would.
+fn shellexpand_home(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_default();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
+}
+
 // ── App helpers ───────────────────────────────────────────────────────────────
 
 impl App {
@@ -551,6 +577,23 @@ impl App {
                 None
             }
         })
+    }
+
+    /// Queue cover generation for chapters that don't have covers yet.
+    /// Register `path` as a library folder (if not already) and scan it.
+    /// Shared by the "Browse…" file-picker flow and the typed-path field.
+    fn add_library_folder(&mut self, path: PathBuf) -> Task<Message> {
+        if let Some(db) = &self.db {
+            let _ = library::add_library_dir(db, &path.to_string_lossy());
+        }
+        if !self.library_dirs.contains(&path) {
+            self.library_dirs.push(path.clone());
+        }
+        let mut tasks = Vec::new();
+        for entry in discover_library_entries(&path) {
+            tasks.push(scan_entry_task(entry));
+        }
+        Task::batch(tasks)
     }
 
     /// Queue cover generation for chapters that don't have covers yet.
@@ -679,6 +722,7 @@ impl Application for App {
             library_search: String::new(),
             library_covers: HashMap::new(),
             library_dirs: library_dirs.clone(),
+            library_path_input: String::new(),
             settings,
             context_page: ContextPage::Settings,
         };
@@ -1117,13 +1161,24 @@ impl Application for App {
             }
             Message::PageDecoded(index, result) => {
                 self.pending.remove(&index);
+                let is_current = index == self.current_page;
                 if let Ok(page) = result {
                     let handle = widget::image::Handle::from_rgba(
                         page.width, page.height, page.rgba.clone(),
                     );
                     self.cache.insert(index, (handle, page));
                 }
+                if is_current {
+                    // The freshly-uploaded texture sometimes doesn't paint on
+                    // the very frame it lands in the cache, so force one more
+                    // render pass shortly after.
+                    return cosmic::task::future(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Message::Redraw
+                    });
+                }
             }
+            Message::Redraw => {}
             Message::LoadFailed(why) => {
                 self.loading = false;
                 self.error = Some(why);
@@ -1204,17 +1259,23 @@ impl Application for App {
                         return Task::none();
                     }
                 };
-                if let Some(db) = &self.db {
-                    let _ = library::add_library_dir(db, &path.to_string_lossy());
+                return self.add_library_folder(path);
+            }
+            Message::LibraryPathInputChanged(text) => {
+                self.library_path_input = text;
+            }
+            Message::LibraryPathInputSubmitted => {
+                let text = self.library_path_input.trim().to_string();
+                if text.is_empty() {
+                    return Task::none();
                 }
-                if !self.library_dirs.contains(&path) {
-                    self.library_dirs.push(path.clone());
+                let path = PathBuf::from(shellexpand_home(&text));
+                if !path.is_dir() {
+                    self.error = Some(format!("not a folder: {}", path.display()));
+                    return Task::none();
                 }
-                let mut tasks = Vec::new();
-                for entry in discover_library_entries(&path) {
-                    tasks.push(scan_entry_task(entry));
-                }
-                return Task::batch(tasks);
+                self.library_path_input.clear();
+                return self.add_library_folder(path);
             }
             Message::LibraryEntryScanned(result) => {
                 let Ok(outcome) = result else { return Task::none() };
@@ -1407,6 +1468,24 @@ impl Application for App {
                         self.app_view = AppView::Reader;
                         return open_any(path);
                     }
+                }
+            }
+            Message::FitPage => {
+                let Some(page) = self.page_data(self.current_page) else { return Task::none() };
+                let Some(id) = self.core.main_window_id() else { return Task::none() };
+                if page.height == 0 {
+                    return Task::none();
+                }
+                let aspect = page.width as f32 / page.height as f32;
+                return window::size(id)
+                    .map(move |size| {
+                        Message::FitPageSize(cosmic::iced::Size::new(size.height * aspect, size.height))
+                    })
+                    .map(cosmic::Action::App);
+            }
+            Message::FitPageSize(size) => {
+                if let Some(id) = self.core.main_window_id() {
+                    return window::resize(id, size).map(cosmic::Action::App);
                 }
             }
         }
@@ -2011,6 +2090,9 @@ impl App {
             icon::from_name("view-fullscreen-symbolic")
         };
         vec![
+            widget::button::icon(icon::from_name("zoom-fit-best-symbolic"))
+                .on_press(Message::FitPage)
+                .into(),
             widget::button::icon(icon::from_name("dialog-information-symbolic"))
                 .on_press(Message::ToggleInfo)
                 .into(),
@@ -2083,13 +2165,29 @@ impl App {
             }
         }
 
+        let add_folder_row = widget::Row::new()
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .push(
+                widget::text_input("Type or paste a folder path…", &self.library_path_input)
+                    .on_input(Message::LibraryPathInputChanged)
+                    .on_submit(|_| Message::LibraryPathInputSubmitted)
+                    .width(Length::Fill),
+            )
+            .push(
+                widget::button::standard("Add")
+                    .on_press(Message::LibraryPathInputSubmitted),
+            )
+            .push(
+                widget::button::standard("Browse…")
+                    .on_press(Message::AddLibraryFolder),
+            );
+
         widget::settings::view_column(vec![
             appearance.into(),
             reading.into(),
             library_section.into(),
-            widget::button::standard("Add Library Folder")
-                .on_press(Message::AddLibraryFolder)
-                .into(),
+            add_folder_row.into(),
         ])
         .into()
     }

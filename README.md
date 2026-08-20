@@ -6,8 +6,10 @@ archives (`.cbz`/`.cbr`), manga/comic series folders, and `.epub` books.
 ## Features
 
 - Library view with covers, search, and a "Continue Reading" shelf
-- Add library folders that get scanned and grouped automatically
-- Settings drawer: backdrop style & opacity, layout, metadata lookup
+- Add library folders that get scanned and grouped automatically, either by
+  browsing or by typing/pasting a path (`~` expands to home)
+- Settings drawer: backdrop style & opacity, layout, metadata lookup,
+  library folder list
 - Chapter-aware series folders (nested `.cbz`/`.cbr`/image-dir chapters)
 - Fast CBR opening: pages are extracted in one pass and cached on disk
   instead of re-streaming the archive per page (see src/comic.rs)
@@ -18,7 +20,8 @@ archives (`.cbz`/`.cbr`), manga/comic series folders, and `.epub` books.
   touchscreen pinch zooms (see the libcosmic fork note below), `Ctrl`+
   trackpad scroll also zooms, plain trackpad two-finger scroll pans a
   zoomed-in image (free diagonal movement), click-drag pans too, and
-  `M`/`Ctrl 0` toggle/reset zoom
+  `M`/`Ctrl 0` toggle/reset zoom, "Fit Page" resizes the window's width to
+  match the current page's aspect ratio (height unchanged)
 - Drag and drop a file, folder, or book onto the window to open it
 - Metadata debug panel (the `i` button): embedded `ComicInfo.xml` when
   present, plus what it matched via AniList (manga/anime) and ComicVine
